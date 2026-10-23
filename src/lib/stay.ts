@@ -1,0 +1,319 @@
+import { addDays, differenceInCalendarDays, format, parseISO } from "date-fns";
+import { uid, normRoom } from "./format";
+import type { GuestEntry } from "./types";
+
+export function stayKey(g: {
+  name: string;
+  roomNo: string;
+  source?: string | null;
+  mode: string;
+}) {
+  return [
+    g.name.trim().toUpperCase(),
+    g.roomNo.trim(),
+    (g.source ?? "").trim().toUpperCase(),
+    g.mode,
+  ].join("|");
+}
+
+/** Name + room + mode — the register duplicate key. */
+export function postingKey(g: { name: string; roomNo: string; mode: string }) {
+  return `${g.name.trim().toUpperCase()}|${normRoom(g.roomNo)}|${g.mode}`;
+}
+
+export function findDuplicateOnDate(
+  guests: GuestEntry[],
+  date: string,
+  match: { name: string; roomNo: string; mode: string },
+  exceptId?: string,
+): GuestEntry | null {
+  const key = postingKey(match);
+  return (
+    guests.find(
+      (g) =>
+        g.date === date &&
+        g.id !== exceptId &&
+        postingKey(g) === key,
+    ) ?? null
+  );
+}
+
+export function addDaysIso(iso: string, days: number) {
+  return format(addDays(parseISO(iso), days), "yyyy-MM-dd");
+}
+
+/** Last occupied night D checks out next morning (hotel day 11:00 AM → 11:00 AM). */
+export function checkoutFromLastNight(lastNight: string) {
+  return addDaysIso(lastNight, 1);
+}
+
+export function nightsFromDates(checkIn: string, checkOut: string) {
+  try {
+    return Math.max(
+      0,
+      differenceInCalendarDays(parseISO(checkOut), parseISO(checkIn)),
+    );
+  } catch {
+    return 0;
+  }
+}
+
+export function stayDates(guests: GuestEntry[], g: GuestEntry) {
+  const nights = guests
+    .filter((x) => stayKey(x) === stayKey(g))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const checkIn =
+    g.checkIn ||
+    nights.reduce((m, x) => (m && m < x.date ? m : x.date), g.date);
+  const last = nights[nights.length - 1] ?? g;
+  const lastNight = last.date || g.date;
+  const stillIn = last.stay !== "out";
+  const checkOut = stillIn
+    ? ""
+    : last.checkOut || checkoutFromLastNight(lastNight);
+  return {
+    checkIn,
+    checkOut,
+    nights: stillIn
+      ? Math.max(nights.length, nightsFromDates(checkIn, checkoutFromLastNight(lastNight)))
+      : nightsFromDates(checkIn, checkOut),
+  };
+}
+
+/** A new stay starts only when the guest actually left and came again. */
+export function stayBreaks(
+  prev: { date: string; stay?: string | null; checkIn?: string | null },
+  next: { date: string; stay?: string | null; checkIn?: string | null },
+) {
+  const prevIn = (prev.checkIn || prev.date).slice(0, 10);
+  const nextIn = (next.checkIn || next.date).slice(0, 10);
+  if (prevIn && nextIn && prevIn === nextIn) return false;
+  if (prev.stay === "out" && nextIn && prevIn && nextIn !== prevIn) return true;
+  let days = 99;
+  try {
+    days = differenceInCalendarDays(parseISO(next.date), parseISO(prev.date));
+  } catch {
+    return next.date !== prev.date;
+  }
+  if (days > 1) return true;
+  if (prev.stay === "out" && days <= 0) return true;
+  return false;
+}
+
+export function consecutiveStayNights(guests: GuestEntry[]): GuestEntry[][] {
+  const groups = new Map<string, GuestEntry[]>();
+  for (const g of guests) {
+    const k = [g.name.trim().toUpperCase(), g.mode].join("|");
+    const list = groups.get(k) ?? [];
+    list.push(g);
+    groups.set(k, list);
+  }
+  const chunks: GuestEntry[][] = [];
+  for (const list of groups.values()) {
+    const sorted = [...list].sort(
+      (a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id),
+    );
+    let cur: GuestEntry[] = [];
+    for (const n of sorted) {
+      const prev = cur[cur.length - 1];
+      if (prev && stayBreaks(prev, n)) {
+        chunks.push(cur);
+        cur = [];
+      }
+      cur.push(n);
+    }
+    if (cur.length) chunks.push(cur);
+  }
+  return chunks;
+}
+
+export function stayChunkIds(guests: GuestEntry[], id: string): Set<string> {
+  const row = guests.find((g) => g.id === id);
+  if (!row) return new Set([id]);
+  const chunk = consecutiveStayNights(
+    guests.filter((g) => stayKey(g) === stayKey(row)),
+  ).find((nights) => nights.some((g) => g.id === id));
+  return new Set((chunk ?? [row]).map((g) => g.id));
+}
+
+/** Source/name edits follow the whole stay so Balance does not split one company. */
+export function applyGuestPatch(
+  guests: GuestEntry[],
+  id: string,
+  patch: Partial<GuestEntry>,
+): GuestEntry[] {
+  const prev = guests.find((g) => g.id === id);
+  if (!prev) return guests;
+  const oldKey = stayKey(prev);
+  const shareSource = Object.prototype.hasOwnProperty.call(patch, "source");
+  const shareName = Object.prototype.hasOwnProperty.call(patch, "name");
+  const shareGst = Object.prototype.hasOwnProperty.call(patch, "gst");
+  const shareInv = Object.prototype.hasOwnProperty.call(patch, "gstInvoiceNo");
+  const shareRef = Object.prototype.hasOwnProperty.call(patch, "payRefNo");
+  const shareOta = Object.prototype.hasOwnProperty.call(patch, "ota") ||
+    Object.prototype.hasOwnProperty.call(patch, "otaChannel");
+  const chunkIds = stayChunkIds(guests, id);
+  return guests.map((g) => {
+    if (g.id === id) return { ...g, ...patch };
+    if (stayKey(g) !== oldKey) return g;
+    const sameChunk = chunkIds.has(g.id);
+    return {
+      ...g,
+      ...(shareSource ? { source: patch.source ?? null } : {}),
+      ...(shareName && patch.name ? { name: patch.name } : {}),
+      ...(sameChunk && shareGst ? { gst: Boolean(patch.gst) } : {}),
+      ...(sameChunk && shareInv ? { gstInvoiceNo: patch.gstInvoiceNo ?? null } : {}),
+      ...(sameChunk && shareRef ? { payRefNo: patch.payRefNo ?? null } : {}),
+      ...(sameChunk && shareOta
+        ? {
+            ota: Boolean(patch.ota),
+            otaChannel: patch.otaChannel ?? null,
+          }
+        : {}),
+    };
+  });
+}
+
+export function applyStay(
+  guests: GuestEntry[],
+  id: string,
+  stay: "continue" | "out",
+): GuestEntry[] {
+  const row = guests.find((g) => g.id === id);
+  if (!row) return guests;
+  const key = stayKey(row);
+  const nights = guests
+    .filter((g) => stayKey(g) === key)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const first = nights[0];
+  const checkIn = first?.checkIn || first?.date || row.date;
+
+  if (stay === "out") {
+    return guests
+      .filter((g) => !(stayKey(g) === key && g.date > row.date))
+      .map((g) => {
+        if (stayKey(g) !== key) return g;
+        if (g.id === id) {
+          return {
+            ...g,
+            stay: "out",
+            checkIn,
+            checkOut: checkoutFromLastNight(row.date),
+          };
+        }
+        if (g.date <= row.date) {
+          return { ...g, checkIn, checkOut: checkoutFromLastNight(row.date) };
+        }
+        return g;
+      });
+  }
+
+  const who = `${row.name.trim().toUpperCase()}|${normRoom(row.roomNo)}`;
+  let nextGuests = guests.map((g) => {
+    const person = `${g.name.trim().toUpperCase()}|${normRoom(g.roomNo)}`;
+    const samePersonNight =
+      person === who && (g.date === row.date || g.date === addDaysIso(row.date, 1));
+    if (stayKey(g) !== key && !samePersonNight) return g;
+    if (person === who && g.date === addDaysIso(row.date, 1)) {
+      return {
+        ...g,
+        source: row.source ?? g.source ?? null,
+        mode: row.mode,
+        stay: "continue" as const,
+        checkIn,
+        checkOut: null,
+        outTime: null,
+      };
+    }
+    if (g.id === id || g.stay === "out" || g.checkOut) {
+      return {
+        ...g,
+        stay: "continue" as const,
+        checkIn,
+        checkOut: null,
+        outTime: null,
+      };
+    }
+    return {
+      ...g,
+      checkIn,
+      checkOut: null,
+    };
+  });
+
+  const next = addDaysIso(row.date, 1);
+  const exists = nextGuests.some((g) => {
+    if (g.date !== next) return false;
+    const person = `${g.name.trim().toUpperCase()}|${normRoom(g.roomNo)}`;
+    return stayKey(g) === key || person === who;
+  });
+  if (!exists) {
+    const slNo =
+      nextGuests.filter((g) => g.date === next).reduce((m, x) => Math.max(m, x.slNo), 0) +
+      1;
+    nextGuests = [
+      ...nextGuests,
+      {
+        ...row,
+        id: uid("g"),
+        date: next,
+        slNo,
+        stay: "continue",
+        checkIn,
+        checkOut: null,
+        outTime: null,
+      },
+    ];
+  }
+  return nextGuests;
+}
+
+/** Occupied rooms on a date — includes guests already marked out that night. */
+export function occupantsOnDate(guests: GuestEntry[], date: string): GuestEntry[] {
+  const seen = new Set<string>();
+  const out: GuestEntry[] = [];
+  for (const g of guests) {
+    if (g.date !== date) continue;
+    const k = stayKey(g);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(g);
+  }
+  return out.sort(
+    (a, b) =>
+      a.roomNo.localeCompare(b.roomNo, undefined, { numeric: true }) ||
+      a.slNo - b.slNo,
+  );
+}
+
+/** In-house guests on a date, one row per stay. Already checked out are skipped. */
+export function inHouseOnDate(guests: GuestEntry[], date: string): GuestEntry[] {
+  return occupantsOnDate(guests, date).filter((g) => g.stay !== "out");
+}
+
+export function stayOnDate(
+  guests: GuestEntry[],
+  g: GuestEntry,
+  date: string,
+): boolean {
+  const k = stayKey(g);
+  return guests.some((x) => x.date === date && stayKey(x) === k);
+}
+
+/**
+ * Night audit: ticked ids continue onto the next calendar day.
+ * Everyone else in-house that night is checked out.
+ */
+export function applyYesterdayRoll(
+  guests: GuestEntry[],
+  fromDate: string,
+  continueIds: Iterable<string>,
+): GuestEntry[] {
+  const keep = new Set(continueIds);
+  const rows = occupantsOnDate(guests, fromDate);
+  let next = guests;
+  for (const g of rows) {
+    next = applyStay(next, g.id, keep.has(g.id) ? "continue" : "out");
+  }
+  return next;
+}

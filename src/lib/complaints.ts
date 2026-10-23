@@ -1,0 +1,163 @@
+import { uid } from "./format";
+
+export type ComplaintLevel = "red" | "yellow" | "green";
+
+export interface RoomComplaint {
+  id: string;
+  roomNo: string;
+  note: string;
+  level: ComplaintLevel;
+  createdAt: string;
+  by?: string;
+}
+
+export function packComplaintNote(note: string, by: string) {
+  const clean = note.replace(/\n?\[\[by:[\s\S]*?\]\]\s*$/g, "").trim();
+  const who = by.trim().replace(/[[\]]/g, "");
+  return who ? `${clean}\n[[by:${who}]]` : clean;
+}
+
+export function unpackComplaintNote(note: string) {
+  const match = note.match(/^(.*)\[\[by:([^\]\n]*)\]\]\s*$/s);
+  if (!match) return { note: note.trim(), by: "" };
+  return { note: match[1].trim(), by: match[2].trim() };
+}
+
+export const COMPLAINT_LEVELS: {
+  id: ComplaintLevel;
+  label: string;
+  hint: string;
+}[] = [
+  { id: "red", label: "Emergency", hint: "Fix now" },
+  { id: "yellow", label: "Moderate", hint: "Keep watching" },
+  { id: "green", label: "Solved", hint: "Closed" },
+];
+
+const LIVE = 2;
+export const FRONT_SLOTS = 3;
+
+export function emptyComplaint(
+  roomNo: string,
+  level: ComplaintLevel,
+  note: string,
+  by = "",
+): RoomComplaint {
+  return {
+    id: uid("c"),
+    roomNo,
+    note: note.trim(),
+    level,
+    createdAt: new Date().toISOString().slice(0, 10),
+    by: by.trim(),
+  };
+}
+
+export function normalizeComplaints(rows: RoomComplaint[] | undefined): RoomComplaint[] {
+  return (rows ?? [])
+    .filter((r) => r && typeof r.roomNo === "string" && r.roomNo.trim())
+    .map((r) => {
+      const packed = unpackComplaintNote(r.note ?? "");
+      const by = (typeof r.by === "string" ? r.by.trim() : "") || packed.by;
+      return {
+        id: r.id || uid("c"),
+        roomNo: r.roomNo.trim(),
+        note: packed.note,
+        level: r.level === "red" || r.level === "green" ? r.level : "yellow",
+        createdAt: (r.createdAt ?? "").slice(0, 10),
+        by,
+      };
+    });
+}
+
+export function complaintsForRoom(rows: RoomComplaint[], roomNo: string) {
+  return rows.filter((r) => r.roomNo === roomNo && !isAcService(r));
+}
+
+export const AC_SERVICES = [
+  { id: "jet-pump", label: "Jet pump service" },
+  { id: "breakdown", label: "Breakdown service" },
+  { id: "gas", label: "Gas top up" },
+  { id: "motherboard", label: "Motherboard service" },
+] as const;
+
+export type AcServiceKind = (typeof AC_SERVICES)[number]["id"];
+
+export function acServiceNote(kind: AcServiceKind) {
+  return `[[ac:${kind}]]`;
+}
+
+export function acServiceKind(note: string): AcServiceKind | null {
+  const match = note.match(/\[\[ac:(jet-pump|breakdown|gas|motherboard)\]\]/);
+  return match ? (match[1] as AcServiceKind) : null;
+}
+
+export function isAcService(row: { note: string }) {
+  return acServiceKind(row.note) != null;
+}
+
+export function acServiceLabel(kind: AcServiceKind) {
+  return AC_SERVICES.find((row) => row.id === kind)?.label ?? kind;
+}
+
+export const COMPLAINT_DESKS = ["Reception", "Other"] as const;
+
+export function isComplaintDesk(roomNo: string) {
+  return (COMPLAINT_DESKS as readonly string[]).includes(roomNo);
+}
+
+export function complaintPlaceLabel(roomNo: string) {
+  return isComplaintDesk(roomNo) ? roomNo : `Room ${roomNo}`;
+}
+
+/** Older cubes shrink; the last two stay full-size with one empty cube in front. */
+export function roomCubeLayout(items: RoomComplaint[]) {
+  if (items.length <= LIVE) {
+    const slots: (RoomComplaint | null)[] = [...items];
+    while (slots.length < FRONT_SLOTS) slots.push(null);
+    return { trail: [] as RoomComplaint[], slots };
+  }
+  return {
+    trail: items.slice(0, items.length - LIVE),
+    slots: [...items.slice(items.length - LIVE), null] as (RoomComplaint | null)[],
+  };
+}
+
+export function demoComplaints(): RoomComplaint[] {
+  return [
+    {
+      id: "c-demo-101-1",
+      roomNo: "101",
+      note: "AC not cooling",
+      level: "red",
+      createdAt: "2026-09-09",
+    },
+    {
+      id: "c-demo-101-2",
+      roomNo: "101",
+      note: "Tap dripping",
+      level: "yellow",
+      createdAt: "2026-09-10",
+    },
+    {
+      id: "c-demo-101-3",
+      roomNo: "101",
+      note: "TV remote missing",
+      level: "green",
+      createdAt: "2026-09-11",
+    },
+    {
+      id: "c-demo-210-1",
+      roomNo: "210",
+      note: "Geyser not heating",
+      level: "red",
+      createdAt: "2026-09-11",
+    },
+    {
+      id: "c-demo-105-1",
+      roomNo: "105",
+      note: "Door lock sticky",
+      level: "yellow",
+      createdAt: "2026-09-11",
+    },
+  ];
+}

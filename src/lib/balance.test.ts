@@ -1,0 +1,478 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import {
+  allocateStaysFifo,
+  buildDueAccounts,
+  splitStayNights,
+  stayFromNights,
+  type DueLine,
+  type DueStay,
+} from "./balance.ts";
+import type { GuestEntry, NamedAmount } from "./types.ts";
+
+function night(
+  p: Partial<DueLine> & Pick<DueLine, "id" | "date" | "name">,
+): DueLine {
+  return {
+    roomNo: "101",
+    amount: 2000,
+    source: "Flysky",
+    stay: "continue",
+    ...p,
+  };
+}
+
+function guest(
+  p: Partial<GuestEntry> & Pick<GuestEntry, "id" | "date" | "name">,
+): GuestEntry {
+  return {
+    slNo: 1,
+    roomNo: "101",
+    mode: "BALANCE",
+    amount: 2000,
+    source: "Flysky",
+    stay: "continue",
+    ...p,
+  };
+}
+
+function receipt(
+  p: Partial<NamedAmount> & Pick<NamedAmount, "id" | "amount">,
+): NamedAmount {
+  return {
+    date: "2026-09-05",
+    particular: "Flysky",
+    mode: "CASH",
+    kind: "due",
+    ...p,
+  };
+}
+
+describe("stay grouping", () => {
+  it("collapses consecutive nights into one stay", () => {
+    const stays = splitStayNights([
+      night({ id: "1", date: "2026-09-01", name: "RAMESH" }),
+      night({ id: "2", date: "2026-09-02", name: "RAMESH" }),
+      night({ id: "3", date: "2026-09-03", name: "RAMESH", stay: "out" }),
+    ]);
+    assert.equal(stays.length, 1);
+    const row = stayFromNights(stays[0]!);
+    assert.equal(row.days, 3);
+    assert.equal(row.perDay, 2000);
+    assert.equal(row.billed, 6000);
+    assert.equal(row.checkIn, "2026-09-01");
+    assert.equal(row.checkOut, "2026-09-04");
+    assert.equal(row.inHouse, false);
+  });
+
+  it("counts nights from check-in 11:00 AM to checkout 11:00 AM", () => {
+    const stays = splitStayNights([
+      night({
+        id: "1",
+        date: "2026-09-06",
+        name: "PRASAD",
+        roomNo: "210",
+        source: "MOT",
+        checkIn: "2026-09-01",
+      }),
+      night({
+        id: "2",
+        date: "2026-09-07",
+        name: "PRASAD",
+        roomNo: "210",
+        source: "MOT",
+        checkIn: "2026-09-01",
+      }),
+      night({
+        id: "3",
+        date: "2026-09-08",
+        name: "PRASAD",
+        roomNo: "210",
+        source: "MOT",
+        checkIn: "2026-09-01",
+      }),
+      night({
+        id: "4",
+        date: "2026-09-09",
+        name: "PRASAD",
+        roomNo: "210",
+        source: "MOT",
+        checkIn: "2026-09-01",
+        stay: "out",
+      }),
+    ]);
+    assert.equal(stays.length, 1);
+    const row = stayFromNights(stays[0]!);
+    assert.equal(row.checkIn, "2026-09-01");
+    assert.equal(row.checkOut, "2026-09-10");
+    assert.equal(row.days, 9);
+    assert.equal(row.perDay, 2000);
+    assert.equal(row.billed, 8000);
+  });
+
+  it("keeps a continued guest as one stay even when later dates exist", () => {
+    const nights = [
+      night({ id: "1", date: "2026-09-01", name: "ABDUL", checkIn: "2026-09-01" }),
+      night({ id: "2", date: "2026-09-02", name: "ABDUL", checkIn: "2026-09-01" }),
+      night({ id: "3", date: "2026-09-04", name: "ABDUL", checkIn: "2026-09-01" }),
+      night({ id: "4", date: "2026-09-11", name: "ABDUL", checkIn: "2026-09-01", roomNo: "204" }),
+      night({ id: "5", date: "2026-09-14", name: "ABDUL", checkIn: "2026-09-01" }),
+      night({ id: "6", date: "2026-09-30", name: "ABDUL", checkIn: "2026-09-01", stay: "continue" }),
+    ];
+    assert.equal(splitStayNights(nights).length, 1);
+    const row = stayFromNights(nights, "2026-10-11");
+    assert.equal(row.checkIn, "2026-09-01");
+    assert.equal(row.checkOut, null);
+    assert.equal(row.inHouse, true);
+    assert.equal(row.billed, 12000);
+  });
+
+  it("keeps a mistaken checkout as one stay when the next day continues", () => {
+    const stays = splitStayNights([
+      night({
+        id: "1",
+        date: "2026-09-09",
+        name: "PRASAD",
+        roomNo: "210",
+        stay: "out",
+        checkOut: "2026-09-10",
+      }),
+      night({
+        id: "2",
+        date: "2026-09-10",
+        name: "PRASAD",
+        roomNo: "210",
+        stay: "continue",
+        checkIn: "2026-09-09",
+      }),
+    ]);
+    assert.equal(stays.length, 1);
+    const accounts = buildDueAccounts(
+      [
+        guest({
+          id: "1",
+          date: "2026-09-09",
+          name: "PRASAD",
+          roomNo: "210",
+          source: "MOT",
+          stay: "out",
+          checkOut: "2026-09-10",
+          amount: 2000,
+        }),
+        guest({
+          id: "2",
+          date: "2026-09-10",
+          name: "PRASAD",
+          roomNo: "210",
+          source: "",
+          stay: "continue",
+          amount: 2000,
+        }),
+      ],
+      [],
+    );
+    assert.equal(accounts.length, 1);
+    assert.equal(accounts[0]!.key, "MOT");
+    assert.equal(accounts[0]!.stays.length, 1);
+    assert.equal(accounts[0]!.billed, 4000);
+  });
+
+  it("splits a return visit after checkout", () => {
+    const stays = splitStayNights([
+      night({ id: "1", date: "2026-09-01", name: "RAMESH", stay: "out" }),
+      night({ id: "2", date: "2026-09-10", name: "RAMESH" }),
+    ]);
+    assert.equal(stays.length, 2);
+  });
+
+  it("splits a calendar gap into two stays", () => {
+    const stays = splitStayNights([
+      night({ id: "1", date: "2026-09-01", name: "RAMESH" }),
+      night({ id: "2", date: "2026-09-05", name: "RAMESH" }),
+    ]);
+    assert.equal(stays.length, 2);
+  });
+});
+
+describe("FIFO paid tick", () => {
+  it("ticks the oldest stay Paid first", () => {
+    const stays: DueStay[] = [
+      {
+        id: "old",
+        name: "A",
+        roomNo: "101",
+        checkIn: "2026-09-01",
+        checkOut: "2026-09-02",
+        inHouse: false,
+        days: 2,
+        perDay: 2000,
+        billed: 4000,
+        paid: 0,
+        remaining: 4000,
+        status: "open",
+      },
+      {
+        id: "new",
+        name: "B",
+        roomNo: "102",
+        checkIn: "2026-09-03",
+        checkOut: null,
+        inHouse: true,
+        days: 1,
+        perDay: 2000,
+        billed: 2000,
+        paid: 0,
+        remaining: 2000,
+        status: "open",
+      },
+    ];
+    const out = allocateStaysFifo(stays, 4000);
+    assert.equal(out[0]!.status, "paid");
+    assert.equal(out[0]!.remaining, 0);
+    assert.equal(out[1]!.status, "open");
+    assert.equal(out[1]!.remaining, 2000);
+  });
+
+  it("marks a leftover as Partial", () => {
+    const stays: DueStay[] = [
+      {
+        id: "only",
+        name: "A",
+        roomNo: "101",
+        checkIn: "2026-09-01",
+        checkOut: null,
+        inHouse: true,
+        days: 2,
+        perDay: 1500,
+        billed: 3000,
+        paid: 0,
+        remaining: 3000,
+        status: "open",
+      },
+    ];
+    const out = allocateStaysFifo(stays, 1000);
+    assert.equal(out[0]!.status, "partial");
+    assert.equal(out[0]!.paid, 1000);
+    assert.equal(out[0]!.remaining, 2000);
+  });
+});
+
+describe("buildDueAccounts stays", () => {
+  it("puts Flysky guests under one source and ticks paid after collection", () => {
+    const accounts = buildDueAccounts(
+      [
+        guest({ id: "a1", date: "2026-09-01", name: "RAMESH", stay: "out" }),
+        guest({ id: "b1", date: "2026-09-02", name: "SITA" }),
+        guest({
+          id: "c1",
+          date: "2026-09-02",
+          name: "MOTOR MAN",
+          source: "Motor",
+        }),
+      ],
+      [receipt({ id: "r1", amount: 2000 })],
+    );
+    const fly = accounts.find((a) => a.key === "FLYSKY");
+    const motor = accounts.find((a) => a.key === "MOTOR");
+    assert.ok(fly);
+    assert.ok(motor);
+    assert.equal(fly!.stays.length, 2);
+    assert.equal(fly!.stays[0]!.name, "RAMESH");
+    assert.equal(fly!.stays[0]!.status, "paid");
+    assert.equal(fly!.stays[1]!.status, "open");
+    assert.equal(motor!.stays[0]!.status, "open");
+    assert.equal(motor!.collected, 0);
+  });
+
+  it("puts list openings on the Balance source list without treating them as collections", () => {
+    const accounts = buildDueAccounts(
+      [
+        guest({ id: "a1", date: "2026-09-01", name: "RAMESH", stay: "out" }),
+      ],
+      [
+        receipt({
+          id: "o1",
+          amount: 500,
+          particular: "Other · tea",
+          kind: "other",
+        }),
+        receipt({
+          id: "l1",
+          amount: 3500,
+          particular: "New Co",
+          kind: "list",
+          mode: "BALANCE",
+        }),
+        receipt({
+          id: "r2",
+          amount: 1000,
+          particular: "New Co",
+          kind: "due",
+          mode: "CASH",
+        }),
+      ],
+    );
+    assert.equal(accounts.some((a) => a.key === "OTHER · TEA"), false);
+    const listed = accounts.find((a) => a.key === "NEW CO");
+    assert.ok(listed);
+    assert.equal(listed!.listBilled, 3500);
+    assert.equal(listed!.collected, 1000);
+    assert.equal(listed!.remaining, 2500);
+    const fly = accounts.find((a) => a.key === "FLYSKY");
+    assert.ok(fly);
+    assert.equal(fly!.collected, 0);
+    assert.equal(fly!.remaining, 2000);
+  });
+
+  it("cuts remaining after a receive even when the source name is typed loosely", () => {
+    const accounts = buildDueAccounts(
+      [
+        guest({
+          id: "a1",
+          date: "2026-09-01",
+          name: "RAMESH",
+          source: "Fly Sky",
+          stay: "out",
+        }),
+      ],
+      [
+        receipt({
+          id: "r1",
+          amount: 2000,
+          particular: "Fly-Sky",
+          kind: "due",
+          mode: "CASH",
+        }),
+      ],
+    );
+    const fly = accounts.find((a) => a.key === "FLY SKY");
+    assert.ok(fly);
+    assert.equal(fly!.collected, 2000);
+    assert.equal(fly!.remaining, 0);
+    assert.equal(fly!.settled, true);
+  });
+
+  it("does not give Arif's receipt to a longer name", () => {
+    const accounts = buildDueAccounts(
+      [
+        guest({
+          id: "a1",
+          date: "2026-09-01",
+          name: "ARIF",
+          source: "Arif",
+          amount: 3000,
+          stay: "out",
+        }),
+        guest({
+          id: "a2",
+          date: "2026-09-02",
+          name: "ARIF KHAN",
+          source: "Arif Khan",
+          amount: 4000,
+          stay: "out",
+        }),
+      ],
+      [
+        receipt({ id: "r1", amount: 3000, particular: "Arif" }),
+        receipt({ id: "r2", amount: 3000, particular: "ARIF" }),
+        receipt({ id: "r3", amount: 3000, particular: "arif" }),
+      ],
+    );
+    const arif = accounts.find((a) => a.key === "ARIF");
+    const khan = accounts.find((a) => a.key === "ARIF KHAN");
+    assert.ok(arif);
+    assert.ok(khan);
+    assert.equal(arif!.collected, 9000);
+    assert.equal(arif!.remaining, -6000);
+    assert.equal(arif!.settled, true);
+    assert.equal(khan!.collected, 0);
+    assert.equal(khan!.remaining, 4000);
+  });
+
+  it("cuts the company balance when the receipt uses the guest name", () => {
+    const accounts = buildDueAccounts(
+      [
+        guest({
+          id: "a1",
+          date: "2026-09-01",
+          name: "ARIF",
+          source: "Flysky",
+          amount: 2000,
+          stay: "out",
+        }),
+      ],
+      [receipt({ id: "r1", amount: 2000, particular: "Arif" })],
+    );
+    const fly = accounts.find((a) => a.key === "FLYSKY");
+    assert.ok(fly);
+    assert.equal(fly!.collected, 2000);
+    assert.equal(fly!.remaining, 0);
+    assert.equal(fly!.settled, true);
+  });
+
+  it("does not clear Arif when the receipt only says Rif", () => {
+    const accounts = buildDueAccounts(
+      [
+        guest({
+          id: "a1",
+          date: "2026-09-01",
+          name: "ARIF",
+          source: "Arif",
+          amount: 6000,
+          stay: "out",
+        }),
+        guest({
+          id: "a2",
+          date: "2026-09-02",
+          name: "MOTOR",
+          source: "Motor",
+          amount: 4000,
+          stay: "out",
+        }),
+      ],
+      [
+        receipt({ id: "r1", amount: 6000, particular: "RIF" }),
+        receipt({ id: "r2", amount: 6000, particular: "RIF" }),
+        receipt({ id: "r3", amount: 6000, particular: "RIF" }),
+      ],
+    );
+    const arif = accounts.find((a) => a.key === "ARIF");
+    const motor = accounts.find((a) => a.key === "MOTOR");
+    assert.ok(arif);
+    assert.ok(motor);
+    assert.equal(arif!.collected, 0);
+    assert.equal(arif!.remaining, 6000);
+    assert.equal(arif!.settled, false);
+    assert.equal(motor!.remaining, 4000);
+  });
+
+  it("cuts the stamped source even if the typed name is different", () => {
+    const accounts = buildDueAccounts(
+      [
+        guest({
+          id: "a1",
+          date: "2026-09-01",
+          name: "ARIF",
+          source: "Arif",
+          amount: 6000,
+          stay: "out",
+        }),
+      ],
+      [
+        receipt({
+          id: "r1",
+          amount: 6000,
+          particular: "misc",
+          forKey: "ARIF",
+          mode: "QRS",
+        }),
+      ],
+    );
+    const arif = accounts.find((a) => a.key === "ARIF");
+    assert.ok(arif);
+    assert.equal(arif!.collected, 6000);
+    assert.equal(arif!.remaining, 0);
+    assert.equal(arif!.settled, true);
+    assert.equal(arif!.receipts[0]!.mode, "QRS");
+  });
+});

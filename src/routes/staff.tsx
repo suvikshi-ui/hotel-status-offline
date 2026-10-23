@@ -1,0 +1,942 @@
+import { useEffect, useMemo, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import { format, isValid, parseISO } from "date-fns";
+import { Pencil, Plus, Printer, Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { formatDay, money, salaryPayMonthKey, uid } from "@/lib/format";
+import { escapeHtml, printDocument } from "@/lib/print-sheet";
+import { staffPay } from "@/lib/staff-pay";
+import { useLedger } from "@/lib/store";
+import { canWrite } from "@/lib/roles";
+import { HotelLogo } from "@/components/hotel-logo";
+import { SaveCube, useAccountSave } from "@/components/save-cube";
+import { useGate } from "@/components/security-gate";
+import {
+  blankAdvanceMonth,
+  blankSalaryMonth,
+  payrollFileId,
+  type PayrollFile,
+} from "@/lib/payroll-files";
+import type { AdvanceRow, StaffProfile, StaffRow } from "@/lib/types";
+
+export const Route = createFileRoute("/staff")({ component: StaffPage });
+
+type Sheet = "register" | "salary" | "advance";
+
+function StaffPage() {
+  const hotel = useLedger((s) => s.hotel);
+  const date = useLedger((s) => s.selectedDate);
+  const staff = useLedger((s) => s.staff);
+  const staffRegister = useLedger((s) => s.staffRegister);
+  const advances = useLedger((s) => s.advances);
+  const setStaff = useLedger((s) => s.setStaff);
+  const setStaffRegister = useLedger((s) => s.setStaffRegister);
+  const payrollFiles = useLedger((s) => s.payrollFiles);
+  const savePayrollFile = useLedger((s) => s.savePayrollFile);
+  const deletePayrollFile = useLedger((s) => s.deletePayrollFile);
+  const setAdvances = useLedger((s) => s.setAdvances);
+  const { busy: saving, saveToServer } = useAccountSave();
+  const write = canWrite(useLedger((s) => s.appRole));
+  const { gate } = useGate();
+  const [sheet, setSheet] = useState<Sheet>("register");
+  const [regDraft, setRegDraft] = useState<StaffProfile[]>(staffRegister);
+  const [draft, setDraft] = useState<StaffRow[]>(staff);
+  const [advDraft, setAdvDraft] = useState<AdvanceRow[]>(advances);
+
+  useEffect(() => {
+    setRegDraft(staffRegister);
+  }, [staffRegister]);
+
+  const salaryFiles = useMemo(
+    () => payrollFiles.filter((file) => file.kind === "salary"),
+    [payrollFiles],
+  );
+  const advanceFiles = useMemo(
+    () => payrollFiles.filter((file) => file.kind === "advance"),
+    [payrollFiles],
+  );
+  const [salaryPeriod, setSalaryPeriod] = useState(() => salaryPayMonthKey(date));
+  const advancePeriod = date.slice(0, 7);
+  const salarySaved = salaryFiles.find((file) => file.period === salaryPeriod) ?? null;
+  const advanceSaved = advanceFiles.find((file) => file.period === advancePeriod) ?? null;
+  const [salaryOpen, setSalaryOpen] = useState("draft");
+  const [salaryEditing, setSalaryEditing] = useState(false);
+  const [advanceOpen, setAdvanceOpen] = useState("draft");
+  const payMonth = periodLabel(salaryPeriod);
+  const payName = periodMonth(salaryPeriod);
+  const salaryFileOpen =
+    salaryOpen === "draft"
+      ? null
+      : (salaryFiles.find((file) => file.id === salaryOpen) ?? null);
+  const advanceFileOpen =
+    advanceOpen === "draft"
+      ? null
+      : (advanceFiles.find((file) => file.id === advanceOpen) ?? null);
+  const salaryLocked = Boolean(salaryFileOpen) && !salaryEditing;
+  const advanceLocked = Boolean(advanceFileOpen);
+
+  useEffect(() => {
+    const current = salaryFiles.find((file) => file.period === salaryPeriod);
+    setSalaryOpen(current?.id ?? "draft");
+    setSalaryEditing(false);
+    if (!current) {
+      const previous = salaryFiles.find((file) => file.period < salaryPeriod);
+      setDraft(previous ? blankSalaryMonth(previous.staff, salaryPeriod) : staff);
+    }
+  }, [salaryFiles, salaryPeriod, staff]);
+
+  useEffect(() => {
+    const current = advanceFiles.find((file) => file.period === advancePeriod);
+    setAdvanceOpen(current?.id ?? "draft");
+    if (!current) {
+      const previous = advanceFiles.find((file) => file.period < advancePeriod);
+      setAdvDraft(
+        previous ? blankAdvanceMonth(previous.advances, advancePeriod) : advances,
+      );
+    }
+  }, [advanceFiles, advancePeriod, advances]);
+
+  const salaryLines = salaryFileOpen && !salaryEditing ? salaryFileOpen.staff : draft;
+  const advanceLines = advanceFileOpen?.advances ?? advDraft;
+  const rows = useMemo(
+    () =>
+      salaryLines.map((r) => {
+        const { earned, payable } = staffPay(
+          r.salary,
+          r.working,
+          r.extra ?? 0,
+          r.advance,
+          30,
+        );
+        return { ...r, extra: r.extra ?? 0, earned, payable };
+      }),
+    [salaryLines],
+  );
+
+  const payroll = rows.reduce((s, r) => s + r.payable, 0);
+  const earnedTotal = rows.reduce((s, r) => s + r.earned, 0);
+  const extraTotal = rows.reduce((s, r) => s + (r.extra ?? 0), 0);
+  const salaryAdv = rows.reduce((s, r) => s + r.advance, 0);
+  const advCash = advanceLines.reduce((s, r) => s + r.cash, 0);
+  const advQr = advanceLines.reduce((s, r) => s + r.qrs, 0);
+
+  function addProfile() {
+    setRegDraft((prev) => [
+      ...prev,
+      { id: uid("sp"), name: "", mobile: "", mobile2: "", address: "", post: "" },
+    ]);
+  }
+
+  function patchProfile(id: string, field: keyof StaffProfile, value: string) {
+    setRegDraft((prev) =>
+      prev.map((row) => (row.id === id ? { ...row, [field]: value } : row)),
+    );
+  }
+
+  function printRegister() {
+    const body = `<table>
+      <thead><tr>
+        <th>Name</th><th>Mobile</th><th>Mobile 2</th><th>Address</th><th>Post</th>
+      </tr></thead>
+      <tbody>
+        ${regDraft
+          .map(
+            (r) => `<tr>
+          <td>${escapeHtml(r.name)}</td>
+          <td>${escapeHtml(r.mobile)}</td>
+          <td>${escapeHtml(r.mobile2)}</td>
+          <td>${escapeHtml(r.address)}</td>
+          <td>${escapeHtml(r.post)}</td>
+        </tr>`,
+          )
+          .join("")}
+      </tbody>
+    </table>`;
+    toast.message("Opening print…");
+    printDocument({
+      title: "Staff register",
+      heading: hotel.name,
+      blessing: hotel.blessing,
+      sub: "Staff register",
+      table: body,
+    });
+  }
+
+  function addStaff() {
+    if (salaryLocked) return;
+    setDraft((prev) => [
+      ...prev,
+      {
+        id: uid("st"),
+        name: "",
+        salary: 0,
+        role: "Staff",
+        days: "30 DAYS",
+        absent: 0,
+        working: 0,
+        extra: 0,
+        advance: 0,
+        weekOff: 0,
+        total: 0,
+        status: "",
+        month: salaryPeriod,
+      },
+    ]);
+  }
+
+  function patchStaff(id: string, field: keyof StaffRow, value: string) {
+    if (salaryLocked) return;
+    setDraft((prev) =>
+      prev.map((r) => {
+        if (r.id !== id) return r;
+        if (field === "name" || field === "role" || field === "status") {
+          return { ...r, [field]: value };
+        }
+        const n = Number(value);
+        return { ...r, [field]: Number.isFinite(n) ? n : 0 };
+      }),
+    );
+  }
+
+  function patchAdv(id: string, field: keyof AdvanceRow, value: string) {
+    if (advanceLocked) return;
+    setAdvDraft((prev) =>
+      prev.map((r) => {
+        if (r.id !== id) return r;
+        if (field === "name" || field === "month") return { ...r, [field]: value };
+        const n = Number(value);
+        return { ...r, [field]: Number.isFinite(n) ? n : 0 };
+      }),
+    );
+  }
+
+  function printSalary() {
+    const body = `<table>
+      <thead><tr>
+        <th>Name</th><th class="num">Basic</th><th class="num">Working</th>
+        <th class="num">Extra</th><th class="num">Earned</th>
+        <th class="num">Advance</th><th class="num">To pay</th>
+      </tr></thead>
+      <tbody>
+        ${rows
+          .map(
+            (r) => `<tr>
+          <td>${escapeHtml(r.name)}</td>
+          <td class="num">${escapeHtml(money(r.salary))}</td>
+          <td class="num">${r.working}</td>
+          <td class="num">${r.extra}</td>
+          <td class="num">${escapeHtml(money(r.earned))}</td>
+          <td class="num">${escapeHtml(money(r.advance))}</td>
+          <td class="num">${escapeHtml(money(r.payable))}</td>
+        </tr>`,
+          )
+          .join("")}
+      </tbody>
+      <tfoot><tr>
+        <td>Total</td><td></td><td></td>
+        <td class="num">${extraTotal}</td>
+        <td class="num">${escapeHtml(money(earnedTotal))}</td>
+        <td class="num">${escapeHtml(money(salaryAdv))}</td>
+        <td class="num">${escapeHtml(money(payroll))}</td>
+      </tr></tfoot>
+    </table>`;
+    toast.message("Opening print…");
+    printDocument({
+      title: `Salary of ${payName}`,
+      heading: hotel.name,
+      blessing: hotel.blessing,
+      sub: `Salary of ${payName}`,
+      table: body,
+    });
+  }
+
+  function removePayroll(file: PayrollFile, label: string) {
+    gate(
+      () => {
+        deletePayrollFile(file.id);
+        toast.success(`${label} deleted`);
+        void saveToServer();
+      },
+      {
+        title: `Delete ${label}?`,
+        message: "The month file will be removed. You can enter it again after delete.",
+        confirmLabel: "Delete",
+        danger: true,
+        requireCode: true,
+      },
+    );
+  }
+
+  function printAdvance() {
+    const body = `<table>
+      <thead><tr>
+        <th>Name</th><th class="num">Cash</th><th class="num">QR</th><th class="num">Total</th>
+      </tr></thead>
+      <tbody>
+        ${advanceLines
+          .map(
+            (r) => `<tr>
+          <td>${escapeHtml(r.name)}</td>
+          <td class="num">${escapeHtml(money(r.cash))}</td>
+          <td class="num">${escapeHtml(money(r.qrs))}</td>
+          <td class="num">${escapeHtml(money(r.cash + r.qrs))}</td>
+        </tr>`,
+          )
+          .join("")}
+      </tbody>
+      <tfoot><tr>
+        <td>Total</td>
+        <td class="num">${escapeHtml(money(advCash))}</td>
+        <td class="num">${escapeHtml(money(advQr))}</td>
+        <td class="num">${escapeHtml(money(advCash + advQr))}</td>
+      </tr></tfoot>
+    </table>`;
+    toast.message("Opening print…");
+    printDocument({
+      title: "Advance sheet",
+      heading: hotel.name,
+      blessing: hotel.blessing,
+      sub: `Advance · ${formatDay(date)}`,
+      table: body,
+    });
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="hidden border-b border-border pb-3 print:block">
+        <div className="flex items-center gap-3">
+          <HotelLogo mark className="h-12 w-auto shrink-0" />
+          <div>
+            <h2 className="font-display text-2xl font-semibold tracking-tight">
+              {hotel.name}
+            </h2>
+            <p className="mt-1 text-sm text-muted">
+              {hotel.place} · {sheet === "salary" ? `Staff salary register · Salary of ${payName}` : sheet === "advance" ? "Staff advance register" : "Staff register"} · {formatDay(date)}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-end justify-between gap-3 print:hidden">
+        <div>
+          <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted">
+            Payroll
+          </p>
+          <h1 className="mt-1 font-display text-3xl font-semibold tracking-tight">
+            {sheet === "register"
+              ? "Staff register"
+              : sheet === "salary"
+                ? "Staff salary register"
+                : "Staff advance register"}
+          </h1>
+          <p className="mt-1 text-sm text-muted">
+            {sheet === "register"
+              ? "Name, two mobiles, address, and the post you write."
+              : sheet === "salary"
+                ? "Pick September or October, enter the sheet, then Save. Edit opens a saved month."
+                : "Enter the month, then Save. The file locks. Open an old month from the list."}
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {write && (sheet === "register" ||
+          (sheet === "salary" && !salaryLocked) ||
+          (sheet === "advance" && !advanceLocked)) ? (
+          <SaveCube
+            busy={saving}
+            onSave={() => {
+              if (sheet === "salary") {
+                if (salaryFileOpen && !salaryEditing) {
+                  toast.message("Press Edit to change this month");
+                  return;
+                }
+                const next = rows.map(({ earned, payable, ...r }) => ({
+                  ...r,
+                  month: salaryPeriod,
+                  total: payable,
+                }));
+                const file: PayrollFile = {
+                  id: payrollFileId("salary", salaryPeriod),
+                  kind: "salary",
+                  period: salaryPeriod,
+                  createdAt: date.slice(0, 10),
+                  staff: next,
+                  advances: [],
+                };
+                savePayrollFile(file);
+                setSalaryEditing(false);
+                setSalaryOpen(file.id);
+                toast.success(`${payMonth} salary file saved`);
+              } else if (sheet === "advance") {
+                if (advanceSaved) {
+                  toast.message("This month is already saved");
+                  return;
+                }
+                const file: PayrollFile = {
+                  id: payrollFileId("advance", advancePeriod),
+                  kind: "advance",
+                  period: advancePeriod,
+                  createdAt: date.slice(0, 10),
+                  staff: [],
+                  advances: advDraft.map((row) => ({ ...row, month: advancePeriod })),
+                };
+                savePayrollFile(file);
+                toast.success(`${monthLabel(advancePeriod)} advance file saved`);
+              } else {
+                setStaffRegister(regDraft);
+              }
+              void saveToServer();
+            }}
+          />
+          ) : null}
+        </div>
+      </div>
+
+      <Tabs value={sheet} onValueChange={(v) => setSheet(v as Sheet)}>
+        <TabsList className="print:hidden" aria-label="Staff registers">
+          <TabsTrigger value="register">
+            Staff register
+          </TabsTrigger>
+          <TabsTrigger value="salary">
+            Salary{salaryFiles.length ? ` · ${salaryFiles.length}` : ""}
+          </TabsTrigger>
+          <TabsTrigger value="advance">
+            Advance{advanceFiles.length ? ` · ${advanceFiles.length}` : ""}
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="register" className="flex flex-col gap-5">
+          <div className="flex justify-end print:hidden">
+            <Button type="button" variant="outline" onClick={printRegister}>
+              <Printer className="size-4" />
+              Print
+            </Button>
+          </div>
+          <Card>
+            <CardHeader>
+              <CardTitle>Staff register</CardTitle>
+              <p className="text-sm text-muted">
+                Name, two mobile numbers, address, and post. Write the post
+                yourself — housekeeping, manager, or whatever the job is.
+              </p>
+            </CardHeader>
+            <CardContent className="overflow-x-auto p-0">
+              <table className="w-full min-w-[52rem] text-left text-sm">
+                <thead className="text-xs uppercase tracking-wide text-muted">
+                  <tr className="border-y border-border">
+                    <th className="px-5 py-2 font-medium">Name</th>
+                    <th className="px-3 py-2 font-medium">Mobile</th>
+                    <th className="px-3 py-2 font-medium">Mobile 2</th>
+                    <th className="px-3 py-2 font-medium">Address</th>
+                    <th className="px-3 py-2 font-medium">Post</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {regDraft.length ? (
+                    regDraft.map((row) => (
+                      <tr key={row.id} className="border-b border-border/70">
+                        {(
+                          [
+                            ["name", "Name"],
+                            ["mobile", "Mobile"],
+                            ["mobile2", "Second mobile"],
+                            ["address", "Address"],
+                            ["post", "Post"],
+                          ] as const
+                        ).map(([field, label]) => (
+                          <td key={field} className="px-3 py-2">
+                            <Input
+                              aria-label={`${row.name || "staff"} ${label}`}
+                              value={row[field]}
+                              disabled={!write}
+                              inputMode={field === "mobile" || field === "mobile2" ? "tel" : "text"}
+                              placeholder={field === "post" ? "Write the post" : ""}
+                              onChange={(e) => patchProfile(row.id, field, e.target.value)}
+                            />
+                          </td>
+                        ))}
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td className="px-5 py-6 text-muted" colSpan={5}>
+                        No staff yet. Add a name.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+              {write ? (
+              <div className="border-t border-border p-3 print:hidden">
+                <Button type="button" variant="outline" onClick={addProfile}>
+                  <Plus className="size-4" />
+                  Add
+                </Button>
+              </div>
+              ) : null}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="salary" className="flex flex-col gap-5">
+          <MonthFiles
+            current={salaryPeriod}
+            openId={salaryOpen}
+            saved={Boolean(salarySaved)}
+            files={salaryFiles}
+            spanYear
+            editing={salaryEditing}
+            onOpen={(id) => {
+              const file = salaryFiles.find((row) => row.id === id);
+              if (file) setSalaryPeriod(file.period);
+              setSalaryEditing(false);
+              setSalaryOpen(id);
+            }}
+            onPickMonth={(period) => {
+              setSalaryEditing(false);
+              setSalaryPeriod(period);
+              setSalaryOpen("draft");
+            }}
+            onEdit={
+              write && salaryFileOpen
+                ? () => {
+                    setDraft(salaryFileOpen.staff.map((row) => ({ ...row })));
+                    setSalaryEditing(true);
+                  }
+                : undefined
+            }
+            onDelete={write ? (file) => removePayroll(file, `${monthLabel(file.period)} salary`) : undefined}
+          />
+          <div className="flex justify-end print:hidden">
+            <Button type="button" variant="outline" onClick={printSalary}>
+              <Printer className="size-4" />
+              Print
+            </Button>
+          </div>
+          <fieldset
+            disabled={salaryLocked || !write}
+            className="flex min-w-0 flex-col gap-5 border-0 p-0"
+          >
+
+          <div className="grid grid-cols-2 gap-3 print:hidden lg:grid-cols-3">
+            <Card className="p-4">
+              <div className="text-xs font-medium text-muted">Earned</div>
+              <div className="mt-1 font-display text-2xl font-semibold tabular">
+                {money(earnedTotal)}
+              </div>
+            </Card>
+            <Card className="p-4">
+              <div className="text-xs font-medium text-muted">Advance minus</div>
+              <div className="mt-1 font-display text-2xl font-semibold tabular">
+                {money(salaryAdv)}
+              </div>
+            </Card>
+            <Card className="col-span-2 p-4 lg:col-span-1">
+              <div className="text-xs font-medium text-muted">To pay</div>
+              <div className="mt-1 font-display text-2xl font-semibold tabular text-ok">
+                {money(payroll)}
+              </div>
+            </Card>
+          </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Staff salary register</CardTitle>
+              <p className="text-sm text-muted">
+                Payment of {payMonth}. Basic ÷ 30 × (working + extra) −
+                advance = to pay
+              </p>
+            </CardHeader>
+            <CardContent className="overflow-x-auto p-0">
+              <table className="w-full min-w-[56rem] text-left text-sm print:min-w-0">
+                <thead className="text-xs uppercase tracking-wide text-muted">
+                  <tr className="border-y border-border">
+                    <th className="px-5 py-2 font-medium">Name</th>
+                    <th className="px-3 py-2 text-right font-medium">Basic</th>
+                    <th className="px-3 py-2 text-right font-medium">Working</th>
+                    <th className="px-3 py-2 text-right font-medium">Extra day</th>
+                    <th className="px-3 py-2 text-right font-medium">Earned</th>
+                    <th className="px-3 py-2 text-right font-medium">Advance</th>
+                    <th className="px-3 py-2 text-right font-medium">To pay</th>
+                    <th className="px-3 py-2 font-medium">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.id} className="border-b border-border/70">
+                      <td className="px-3 py-2">
+                        <Input
+                          aria-label={`${r.name} name`}
+                          value={r.name}
+                          onChange={(e) => patchStaff(r.id, "name", e.target.value)}
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <AmountField
+                          aria-label={`${r.name} basic salary`}
+                          value={r.salary}
+                          onChange={(v) => patchStaff(r.id, "salary", v)}
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <AmountField
+                          aria-label={`${r.name} working days`}
+                          value={r.working}
+                          onChange={(v) => patchStaff(r.id, "working", v)}
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <AmountField
+                          aria-label={`${r.name} extra working day`}
+                          value={r.extra}
+                          onChange={(v) => patchStaff(r.id, "extra", v)}
+                        />
+                      </td>
+                      <td className="px-3 py-2.5 text-right tabular">
+                        {money(r.earned)}
+                      </td>
+                      <td className="px-3 py-2">
+                        <AmountField
+                          aria-label={`${r.name} advance`}
+                          value={r.advance}
+                          onChange={(v) => patchStaff(r.id, "advance", v)}
+                        />
+                      </td>
+                      <td
+                        className={`px-3 py-2.5 text-right tabular font-medium ${r.payable < 0 ? "text-due" : ""}`}
+                      >
+                        {money(r.payable)}
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <Badge variant={r.status === "HOLD" ? "warn" : "ok"}>
+                          {r.status || "PAID"}
+                        </Badge>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-border bg-bg-warm/50 font-semibold">
+                    <td className="px-5 py-2.5">Total</td>
+                    <td />
+                    <td />
+                    <td className="px-3 py-2.5 text-right tabular">{extraTotal}</td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(earnedTotal)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(salaryAdv)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(payroll)}
+                    </td>
+                    <td />
+                  </tr>
+                </tfoot>
+              </table>
+              <div className="border-t border-border p-3 print:hidden">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={addStaff}
+                  disabled={salaryLocked || !write}
+                >
+                  <Plus className="size-4" />
+                  Add
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+          </fieldset>
+        </TabsContent>
+
+        <TabsContent value="advance" className="flex flex-col gap-5">
+          <MonthFiles
+            current={advancePeriod}
+            openId={advanceOpen}
+            saved={Boolean(advanceSaved)}
+            files={advanceFiles}
+            onOpen={setAdvanceOpen}
+            onDelete={write ? (file) => removePayroll(file, `${monthLabel(file.period)} advance`) : undefined}
+          />
+          <div className="flex justify-end print:hidden">
+            <Button type="button" variant="outline" onClick={printAdvance}>
+              <Printer className="size-4" />
+              Print
+            </Button>
+          </div>
+          <fieldset
+            disabled={advanceLocked || !write}
+            className="flex min-w-0 flex-col gap-5 border-0 p-0"
+          >
+          <div className="flex flex-wrap items-end justify-end gap-2 print:hidden">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setAdvDraft((prev) => [
+                  ...prev,
+                  {
+                    id: uid("adv"),
+                    name: "",
+                    cash: 0,
+                    qrs: 0,
+                    month: date.slice(0, 7),
+                  },
+                ]);
+              }}
+            >
+              Add advance
+            </Button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 print:hidden lg:grid-cols-3">
+            <Card className="p-4">
+              <div className="text-xs font-medium text-muted">Cash</div>
+              <div className="mt-1 font-display text-2xl font-semibold tabular">
+                {money(advCash)}
+              </div>
+            </Card>
+            <Card className="p-4">
+              <div className="text-xs font-medium text-muted">Santosh QR</div>
+              <div className="mt-1 font-display text-2xl font-semibold tabular">
+                {money(advQr)}
+              </div>
+            </Card>
+            <Card className="col-span-2 p-4 lg:col-span-1">
+              <div className="text-xs font-medium text-muted">Advance total</div>
+              <div className="mt-1 font-display text-2xl font-semibold tabular">
+                {money(advCash + advQr)}
+              </div>
+            </Card>
+          </div>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Staff advance register</CardTitle>
+              <p className="text-sm text-muted">
+                Edit name, cash and QR. Total adds itself.
+              </p>
+            </CardHeader>
+            <CardContent className="overflow-x-auto p-0">
+              <table className="w-full min-w-[32rem] text-left text-sm print:min-w-0">
+                <thead className="text-xs uppercase tracking-wide text-muted">
+                  <tr className="border-y border-border">
+                    <th className="px-5 py-2 font-medium">Name</th>
+                    <th className="px-3 py-2 text-right font-medium">Cash</th>
+                    <th className="px-3 py-2 text-right font-medium">QR</th>
+                    <th className="px-3 py-2 text-right font-medium">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {advanceLines.map((r) => (
+                    <tr key={r.id} className="border-b border-border/70">
+                      <td className="px-3 py-2">
+                        <Input
+                          aria-label={`${r.name || "new"} advance name`}
+                          value={r.name}
+                          onChange={(e) => patchAdv(r.id, "name", e.target.value)}
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <Input
+                          aria-label={`${r.name} cash advance`}
+                          type="number"
+                          className="text-right tabular"
+                          value={r.cash}
+                          onChange={(e) => patchAdv(r.id, "cash", e.target.value)}
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <Input
+                          aria-label={`${r.name} QR advance`}
+                          type="number"
+                          className="text-right tabular"
+                          value={r.qrs}
+                          onChange={(e) => patchAdv(r.id, "qrs", e.target.value)}
+                        />
+                      </td>
+                      <td className="px-3 py-2.5 text-right tabular font-medium">
+                        {money(r.cash + r.qrs)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-border bg-bg-warm/50 font-semibold">
+                    <td className="px-5 py-2.5">Total</td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(advCash)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(advQr)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(advCash + advQr)}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </CardContent>
+          </Card>
+          </fieldset>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
+function periodLabel(period: string) {
+  const d = parseISO(`${period}-01`);
+  return isValid(d) ? format(d, "MMMM yyyy") : period;
+}
+
+function periodMonth(period: string) {
+  const d = parseISO(`${period}-01`);
+  return isValid(d) ? format(d, "MMMM") : period;
+}
+
+function monthLabel(period: string) {
+  const d = parseISO(`${period}-01`);
+  return isValid(d) ? format(d, "MMMM yyyy") : period;
+}
+
+function MonthFiles({
+  current,
+  openId,
+  saved,
+  files,
+  spanYear,
+  editing,
+  onOpen,
+  onPickMonth,
+  onEdit,
+  onDelete,
+}: {
+  current: string;
+  openId: string;
+  saved: boolean;
+  files: PayrollFile[];
+  spanYear?: boolean;
+  editing?: boolean;
+  onOpen: (id: string) => void;
+  onPickMonth?: (period: string) => void;
+  onEdit?: () => void;
+  onDelete?: (file: PayrollFile) => void;
+}) {
+  const todayYear = current.slice(0, 4);
+  const [year, setYear] = useState(todayYear);
+  const [month, setMonth] = useState(current.slice(0, 7));
+  const open = files.find((file) => file.id === openId) ?? null;
+  const years = useMemo(() => {
+    const found = new Set(files.map((file) => file.period.slice(0, 4)).filter((value) => value.length === 4));
+    if (todayYear) found.add(todayYear);
+    return [...found].sort((a, b) => b.localeCompare(a));
+  }, [files, todayYear]);
+  const months = useMemo(() => {
+    const found = new Set(
+      files.filter((file) => file.period.startsWith(`${year}-`)).map((file) => file.period.slice(0, 7)),
+    );
+    if (spanYear && /^\d{4}$/.test(year)) {
+      for (let monthNo = 1; monthNo <= 12; monthNo += 1) {
+        found.add(`${year}-${String(monthNo).padStart(2, "0")}`);
+      }
+    }
+    if (year === todayYear) found.add(current.slice(0, 7));
+    return [...found].sort((a, b) => a.localeCompare(b));
+  }, [files, year, todayYear, current, spanYear]);
+
+  return (
+    <div className="flex flex-col gap-3 print:hidden">
+      <div>
+        <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted">Year</p>
+        <div className="flex flex-wrap gap-2">
+          {years.map((value) => (
+            <Button
+              key={value}
+              type="button"
+              size="sm"
+              variant={year === value ? "default" : "outline"}
+              onClick={() => {
+                setYear(value);
+                setMonth("");
+              }}
+            >
+              {value}
+            </Button>
+          ))}
+        </div>
+      </div>
+      <div>
+        <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-muted">Month</p>
+        <div className="flex flex-wrap gap-2">
+          {months.map((value) => {
+            const file = files.find((row) => row.period === value);
+            const active = file ? openId === file.id : month === value && openId === "draft";
+            return (
+              <Button
+                key={value}
+                type="button"
+                size="sm"
+                variant={active ? "default" : "outline"}
+                onClick={() => {
+                  setMonth(value);
+                  if (file) onOpen(file.id);
+                  else if (onPickMonth) onPickMonth(value);
+                  else if (value === current.slice(0, 7) && !saved) onOpen("draft");
+                }}
+              >
+                {monthLabel(value)}
+                {!file && value === current.slice(0, 7) ? " · new" : ""}
+              </Button>
+            );
+          })}
+        </div>
+      </div>
+      {open ? (
+        <div className="flex justify-end gap-2">
+          {onEdit ? (
+            <Button type="button" variant="outline" onClick={onEdit} disabled={editing}>
+              <Pencil className="size-4" />
+              {editing ? "Editing" : "Edit"}
+            </Button>
+          ) : null}
+          {onDelete ? (
+            <Button type="button" variant="danger" onClick={() => onDelete(open)}>
+              <Trash2 className="size-4" />
+              Delete file
+            </Button>
+          ) : null}
+        </div>
+      ) : (
+        <p className="text-sm text-muted">{monthLabel(current)} is not saved yet.</p>
+      )}
+    </div>
+  );
+}
+
+function AmountField({
+  value,
+  onChange,
+  "aria-label": ariaLabel,
+}: {
+  value: number;
+  onChange: (value: string) => void;
+  "aria-label": string;
+}) {
+  return (
+    <Input
+      aria-label={ariaLabel}
+      type="text"
+      inputMode="decimal"
+      autoComplete="off"
+      className="text-right tabular"
+      value={value === 0 ? "" : String(value)}
+      onChange={(e) => onChange(e.target.value.replace(/[^\d.]/g, ""))}
+    />
+  );
+}

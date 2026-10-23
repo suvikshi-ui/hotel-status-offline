@@ -1,0 +1,601 @@
+import { format, parseISO } from "date-fns";
+import type { CSSProperties, ReactNode } from "react";
+import { buildDayTake } from "@/lib/day-report";
+import { otaChannelLabel } from "@/lib/ota-label";
+import { englishNarration } from "@/lib/english-narration";
+import { publicUrl } from "@/lib/public-url";
+import { addDaysIso, stayDates } from "@/lib/stay";
+import type {
+  DayBooks,
+  GuestEntry,
+  ModeAmount,
+  NamedAmount,
+  PayMode,
+} from "@/lib/types";
+
+function rupee(n: number) {
+  return `₹${Math.round(n).toLocaleString("en-IN")}`;
+}
+
+function sept(iso: string) {
+  return format(parseISO(iso), "dd MMM yyyy").replace("Sep", "Sept");
+}
+
+function longDay(iso: string) {
+  return format(parseISO(iso), "EEEE, d MMMM yyyy");
+}
+
+function padRoom(n: string) {
+  const t = n.trim();
+  return /^\d+$/.test(t) ? t.padStart(3, "0") : t;
+}
+
+function roomTag(particular: string, guests: GuestEntry[], date: string) {
+  const raw = particular.trim();
+  if (!raw) return "—";
+  if (/^\d{1,4}[A-Z]?$/i.test(raw)) return raw;
+  const key = raw.toUpperCase();
+  const hits = guests.filter((g) => {
+    const src = (g.source ?? "").trim().toUpperCase();
+    const name = g.name.trim().toUpperCase();
+    return src === key || name === key;
+  });
+  const today = hits.filter((g) => g.date === date);
+  const pool = today.length
+    ? today
+    : hits.length
+      ? [hits.reduce((best, g) => (g.date > best.date ? g : best))]
+      : [];
+  const rooms = [...new Set(pool.map((g) => g.roomNo.trim()).filter(Boolean))];
+  return rooms.length ? rooms.join(", ") : "—";
+}
+
+function sum(rows: { amount: number }[]) {
+  return rows.reduce((s, r) => s + r.amount, 0);
+}
+
+function byMode(rows: { mode: PayMode; amount: number }[], mode: PayMode) {
+  return rows.filter((r) => r.mode === mode).reduce((s, r) => s + r.amount, 0);
+}
+
+const PILL: Record<PayMode, { bg: string; fg: string; label: string }> = {
+  CASH: { bg: "#d8efe4", fg: "#1f6b4a", label: "CASH" },
+  QRS: { bg: "#d8efe4", fg: "#1f6b4a", label: "QRS" },
+  QRPK: { bg: "#dce8f5", fg: "#2c5282", label: "QRPK" },
+  ONLINE: { bg: "#ece8e0", fg: "#5c574e", label: "ONLINE" },
+  BALANCE: { bg: "#f3e4c8", fg: "#8a5a22", label: "BALANCE" },
+};
+
+function Pill({ mode }: { mode: PayMode }) {
+  const p = PILL[mode];
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        background: p.bg,
+        color: p.fg,
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: "0.06em",
+        padding: "2px 8px",
+        borderRadius: 999,
+      }}
+    >
+      {p.label}
+    </span>
+  );
+}
+
+function Section({
+  title,
+  children,
+}: {
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <div style={{ marginTop: 18 }}>
+      <div
+        style={{
+          fontSize: 10,
+          fontWeight: 700,
+          letterSpacing: "0.16em",
+          textTransform: "uppercase",
+          color: "#6f675c",
+          marginBottom: 6,
+        }}
+      >
+        {title}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function TwoCol({
+  left,
+  right,
+}: {
+  left: ReactNode;
+  right: ReactNode;
+}) {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "1fr 1fr",
+        gap: 20,
+        marginTop: 4,
+      }}
+    >
+      <div>{left}</div>
+      <div>{right}</div>
+    </div>
+  );
+}
+
+function EmptyLine() {
+  return (
+    <div
+      style={{
+        padding: "8px 2px",
+        borderBottom: "1px solid #eadfcd",
+        color: "#6f675c",
+        fontSize: 12,
+      }}
+    >
+      —
+    </div>
+  );
+}
+
+function ItemRow({
+  left,
+  amount,
+}: {
+  left: ReactNode;
+  amount: number;
+}) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        gap: 10,
+        padding: "7px 2px",
+        borderBottom: "1px solid #eadfcd",
+        fontSize: 12,
+      }}
+    >
+      <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+        {left}
+      </span>
+      <span style={{ fontVariantNumeric: "tabular-nums", fontWeight: 600 }}>
+        {rupee(amount)}
+      </span>
+    </div>
+  );
+}
+
+const th: CSSProperties = {
+  textAlign: "left",
+  fontSize: 10,
+  fontWeight: 700,
+  letterSpacing: "0.08em",
+  textTransform: "uppercase",
+  color: "#6f675c",
+  padding: "7px 8px",
+  borderBottom: "1px solid #eadfcd",
+};
+const td: CSSProperties = {
+  padding: "8px 8px",
+  borderBottom: "1px solid #eadfcd",
+  verticalAlign: "top",
+  fontSize: 12,
+};
+const num: CSSProperties = {
+  ...td,
+  textAlign: "right",
+  fontVariantNumeric: "tabular-nums",
+};
+
+function cellAmt(n: number) {
+  return n ? rupee(n) : "—";
+}
+
+export function DayChart({
+  hotel,
+  blessing,
+  date,
+  guests,
+  allGuests,
+  food,
+  ws,
+  expenses,
+  receipts,
+}: {
+  hotel: string;
+  blessing: string;
+  date: string;
+  guests: GuestEntry[];
+  allGuests: GuestEntry[];
+  food: ModeAmount[];
+  ws: ModeAmount[];
+  expenses: NamedAmount[];
+  receipts: NamedAmount[];
+  books?: DayBooks;
+}) {
+  const next = addDaysIso(date, 1);
+  const take = buildDayTake(guests, food, ws);
+  const due = receipts.filter((r) => r.kind !== "ota" && r.kind !== "list");
+  const ota = receipts.filter((r) => r.kind === "ota");
+  const plain = receipts.filter((r) => r.kind !== "ota");
+  const cashRecv = byMode(plain, "CASH");
+  const qrsRecv = byMode(plain, "QRS");
+  const pkRecv = byMode(plain, "QRPK");
+  const onRecv = byMode(plain, "ONLINE");
+  const otaRows = [...new Set(ota.map((r) => otaChannelLabel(r.particular)))]
+    .sort((a, b) => {
+      const rank = (name: string) => (name === "FAB" ? 0 : name === "BRAVESTAY" ? 1 : 2);
+      return rank(a) - rank(b) || a.localeCompare(b);
+    })
+    .map((name) => {
+      const rows = ota.filter((r) => otaChannelLabel(r.particular) === name);
+      return {
+        label: `Balance received · ${name}`,
+        cash: byMode(rows, "CASH"),
+        qrs: byMode(rows, "QRS"),
+        pk: byMode(rows, "QRPK"),
+        online: byMode(rows, "ONLINE"),
+      };
+    })
+    .filter((row) => row.cash || row.qrs || row.pk || row.online);
+  const qrsIn =
+    take.santosh.rooms +
+    take.santosh.food +
+    take.santosh.ws +
+    qrsRecv +
+    otaRows.reduce((s, row) => s + row.qrs, 0);
+  const pkIn =
+    take.pk.rooms +
+    take.pk.food +
+    take.pk.ws +
+    pkRecv +
+    otaRows.reduce((s, row) => s + row.pk, 0);
+  const cashIn =
+    take.cash.rooms +
+    take.cash.food +
+    take.cash.ws +
+    cashRecv +
+    otaRows.reduce((s, row) => s + row.cash, 0);
+  const onIn =
+    take.online.rooms +
+    take.online.food +
+    take.online.ws +
+    onRecv +
+    otaRows.reduce((s, row) => s + row.online, 0);
+  const payRows: {
+    label: string;
+    cash: number;
+    qrs: number;
+    pk: number;
+    online: number;
+  }[] = [
+    {
+      label: "Room sale",
+      cash: take.cash.rooms,
+      qrs: take.santosh.rooms,
+      pk: take.pk.rooms,
+      online: take.online.rooms,
+    },
+    {
+      label: "Food",
+      cash: take.cash.food,
+      qrs: take.santosh.food,
+      pk: take.pk.food,
+      online: take.online.food,
+    },
+    {
+      label: "WS",
+      cash: take.cash.ws,
+      qrs: take.santosh.ws,
+      pk: take.pk.ws,
+      online: take.online.ws,
+    },
+    ...(cashRecv || qrsRecv || pkRecv || onRecv
+      ? [
+          {
+            label: "Balance received",
+            cash: cashRecv,
+            qrs: qrsRecv,
+            pk: pkRecv,
+            online: onRecv,
+          },
+        ]
+      : []),
+    ...otaRows,
+  ];
+  const payTotal = {
+    cash: cashIn,
+    qrs: qrsIn,
+    pk: pkIn,
+    online: onIn,
+    all: cashIn + qrsIn + pkIn + onIn,
+  };
+
+  return (
+    <div
+      id="day-chart"
+      className="day-chart"
+      style={{
+        background: "#f7f1e6",
+        color: "#1a1a1a",
+        fontFamily: 'Georgia, "Times New Roman", Times, serif',
+        padding: "18px 20px 28px",
+        border: "1px solid #e2d6c2",
+      }}
+    >
+      <div
+        className="daily-a4-head"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          margin: "-18px -20px 14px",
+          padding: "8px 12px",
+          background: "#1b332a",
+          color: "#f6f0e6",
+        }}
+      >
+        <img src={publicUrl("logo.png?v=4")} alt="" className="logo-3d" style={{ height: 48, width: "auto" }} />
+        <div style={{ flex: 1, textAlign: "center", minWidth: 0 }}>
+          <div
+            style={{
+              fontFamily: '"Fraunces", "Times New Roman", serif',
+              fontSize: 28,
+              fontWeight: 700,
+              letterSpacing: "0.04em",
+              lineHeight: 1.05,
+              color: "#f4c430",
+              transform: "scaleX(0.96)",
+              transformOrigin: "center",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {hotel}
+          </div>
+          <div style={{ marginTop: 2, fontSize: 13, fontFamily: '"Fraunces", "Times New Roman", serif' }}>
+            {blessing}
+          </div>
+        </div>
+        <div style={{ fontWeight: 700, fontSize: 14, textAlign: "right" }}>
+          Detailed daily
+          <div>{longDay(date)}</div>
+        </div>
+      </div>
+      <div style={{ marginTop: 4, fontSize: 16, fontWeight: 600 }}>
+        {sept(date)} 11:00 AM — {sept(next)} 11:00 AM
+      </div>
+      <div style={{ marginTop: 3, marginBottom: 10, fontSize: 11, color: "#6f675c" }}>
+        Same layout as Daily register · {guests.length} posting
+        {guests.length === 1 ? "" : "s"}
+      </div>
+
+      <Section title="Guest register">
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              {["#", "Name", "Room", "Mode", "Amount", "Time", "Check-in", "C.O", "Source"].map(
+                (h) => (
+                  <th key={h} style={th}>
+                    {h}
+                  </th>
+                ),
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {[...guests].sort((a, b) => a.slNo - b.slNo).map((g) => {
+              const dates = stayDates(allGuests, g);
+              const cin = dates.checkIn;
+              const cout = dates.checkOut || next;
+              return (
+                <tr key={g.id}>
+                  <td style={{ ...td, color: "#6f675c" }}>{g.slNo}</td>
+                  <td style={{ ...td, fontWeight: 700 }}>
+                    {g.name.toUpperCase()}
+                    {g.otaChannel === "FAB"
+                      ? " · FAB"
+                      : g.otaChannel === "BRAVE"
+                        ? " · BraveStay"
+                        : g.ota
+                          ? " · OTA"
+                          : ""}
+                  </td>
+                  <td style={td}>{padRoom(g.roomNo)}</td>
+                  <td style={td}>
+                    <Pill mode={g.mode} />
+                  </td>
+                  <td style={{ ...td, fontVariantNumeric: "tabular-nums" }}>
+                    {rupee(g.amount)}
+                  </td>
+                  <td style={{ ...td, color: "#6f675c", whiteSpace: "nowrap" }}>
+                    {g.time || "—"}
+                  </td>
+                  <td style={{ ...td, fontSize: 11, color: "#6f675c" }}>
+                    {sept(cin)}
+                    <br />
+                    {g.inTime || "11:00 AM"}
+                  </td>
+                  <td style={{ ...td, fontSize: 11, color: "#6f675c" }}>
+                    {sept(cout)}
+                    <br />
+                    {g.outTime || "11:00 AM"}
+                  </td>
+                  <td style={td}>{g.source || "—"}</td>
+                </tr>
+              );
+            })}
+            {guests.length === 0 ? (
+              <tr>
+                <td style={td} colSpan={9}>
+                  —
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            padding: "10px 8px 0",
+            fontWeight: 700,
+          }}
+        >
+          <span>Posting total</span>
+          <span style={{ fontVariantNumeric: "tabular-nums" }}>
+            {rupee(take.roomsTotal)}
+          </span>
+        </div>
+      </Section>
+
+      <TwoCol
+        left={
+          <Section title="Food">
+            {food.length === 0 ? (
+              <EmptyLine />
+            ) : (
+              food.map((f) => (
+                <ItemRow
+                  key={f.id}
+                  left={<Pill mode={f.mode} />}
+                  amount={f.amount}
+                />
+              ))
+            )}
+          </Section>
+        }
+        right={
+          <Section title="WS">
+            {ws.length === 0 ? (
+              <EmptyLine />
+            ) : (
+              ws.map((w) => (
+                <ItemRow
+                  key={w.id}
+                  left={<Pill mode={w.mode} />}
+                  amount={w.amount}
+                />
+              ))
+            )}
+          </Section>
+        }
+      />
+
+      <Section title="Expenses">
+        {expenses.length === 0 ? (
+          <EmptyLine />
+        ) : (
+          expenses.map((e) => (
+            <ItemRow
+              key={e.id}
+              left={
+                <>
+                  <span style={{ fontWeight: 600 }}>{englishNarration(e.particular)}</span>
+                  <Pill mode={e.mode} />
+                </>
+              }
+              amount={e.amount}
+            />
+          ))
+        )}
+      </Section>
+
+      <TwoCol
+        left={
+          <Section title="Balance received · source">
+            {due.length === 0 ? (
+              <EmptyLine />
+            ) : (
+              due.map((r) => (
+                <ItemRow
+                  key={r.id}
+                  left={
+                    <>
+                      <span style={{ fontWeight: 600 }}>{roomTag(r.particular, allGuests, date)}</span>
+                      <Pill mode={r.mode} />
+                    </>
+                  }
+                  amount={r.amount}
+                />
+              ))
+            )}
+          </Section>
+        }
+        right={
+          <Section title="Fab / Bravistay">
+            {ota.length === 0 ? (
+              <EmptyLine />
+            ) : (
+              ota.map((r) => (
+                <ItemRow
+                  key={r.id}
+                  left={
+                    <>
+                      <span style={{ fontWeight: 600 }}>{r.particular}</span>
+                      <Pill mode={r.mode} />
+                    </>
+                  }
+                  amount={r.amount}
+                />
+              ))
+            )}
+          </Section>
+        }
+      />
+
+      <Section title="Payment in">
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={th}>Particular</th>
+              <th style={{ ...th, textAlign: "right" }}>Cash</th>
+              <th style={{ ...th, textAlign: "right" }}>Santosh QR</th>
+              <th style={{ ...th, textAlign: "right" }}>P.K. QR</th>
+              <th style={{ ...th, textAlign: "right" }}>Online</th>
+              <th style={{ ...th, textAlign: "right" }}>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {payRows.map((row) => (
+              <tr key={row.label}>
+                <td style={td}>{row.label}</td>
+                <td style={num}>{cellAmt(row.cash)}</td>
+                <td style={num}>{cellAmt(row.qrs)}</td>
+                <td style={num}>{cellAmt(row.pk)}</td>
+                <td style={num}>{cellAmt(row.online)}</td>
+                <td style={{ ...num, fontWeight: 700 }}>
+                  {cellAmt(row.cash + row.qrs + row.pk + row.online)}
+                </td>
+              </tr>
+            ))}
+            <tr>
+              <td style={{ ...td, fontWeight: 800 }}>Total</td>
+              <td style={{ ...num, fontWeight: 800 }}>{rupee(payTotal.cash)}</td>
+              <td style={{ ...num, fontWeight: 800 }}>{rupee(payTotal.qrs)}</td>
+              <td style={{ ...num, fontWeight: 800 }}>{rupee(payTotal.pk)}</td>
+              <td style={{ ...num, fontWeight: 800 }}>{cellAmt(payTotal.online)}</td>
+              <td style={{ ...num, fontWeight: 800 }}>{rupee(payTotal.all)}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style={{ fontSize: 11, color: "#6f675c", marginTop: 8 }}>
+          Cash in today {rupee(payTotal.cash)} · Santosh QR and P.K. QR are separate ·
+          Fab and BraveStay are named on Balance received, and the amount sits in P.K. QR.
+        </p>
+      </Section>
+    </div>
+  );
+}

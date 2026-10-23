@@ -1,0 +1,1397 @@
+import { useMemo, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import { format, parseISO } from "date-fns";
+import {
+  Check,
+  ChevronDown,
+  Printer,
+  Search,
+  Trash2,
+} from "lucide-react";
+import { toast } from "sonner";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ModeBadge } from "@/components/mode-badge";
+import {
+  buildDueAccounts,
+  dueStatusLabel,
+  lookupDueAccount,
+  sourceKey,
+  uniqueSources,
+  type DueAccount,
+  type DueStay,
+} from "@/lib/balance";
+import { printSourceGuests, printSourceSummary } from "@/lib/balance-print";
+import { DUE_PAY_MODES, formatDay, formatDayShort, MODE_LABEL, money, stayStamp } from "@/lib/format";
+import { useLedger, useDayBooks } from "@/lib/store";
+import { useGate } from "@/components/security-gate";
+import { SaveCube, useAccountSave } from "@/components/save-cube";
+import { canWrite } from "@/lib/roles";
+import { isDayLocked } from "@/lib/register-lock";
+import { tellDateLocked } from "@/lib/locked-notice";
+import type { PayMode } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+export const Route = createFileRoute("/balance")({ component: BalancePage });
+
+function checkoutLabel(stay: DueStay) {
+  if (stay.checkOut) return stayStamp(stay.checkOut);
+  return "Continue";
+}
+
+function BalancePage() {
+  const hotel = useLedger((s) => s.hotel);
+  const guests = useLedger((s) => s.guests);
+  const receipts = useLedger((s) => s.balReceived);
+  const lockedDates = useLedger((s) => s.lockedDates);
+  const date = useLedger((s) => s.selectedDate);
+  const addBalReceived = useLedger((s) => s.addBalReceived);
+  const removeBalReceived = useLedger((s) => s.removeBalReceived);
+  const { busy: saving, saveToServer } = useAccountSave();
+  const write = canWrite(useLedger((s) => s.appRole));
+  const { gate } = useGate();
+  const [q, setQ] = useState("");
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [asOn, setAsOn] = useState("");
+  const [sheet, setSheet] = useState<"billed" | "collected" | null>(null);
+  const guestsAsOf = useMemo(
+    () => (asOn ? guests.filter((g) => g.date <= asOn) : guests),
+    [guests, asOn],
+  );
+  const receiptsAsOf = useMemo(
+    () => (asOn ? receipts.filter((r) => r.date <= asOn) : receipts),
+    [receipts, asOn],
+  );
+
+  const accounts = useMemo(
+    () => buildDueAccounts(guestsAsOf, receiptsAsOf),
+    [guestsAsOf, receiptsAsOf],
+  );
+  const books = useDayBooks(date);
+  const filtered = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    return accounts.filter((a) => {
+      if (a.remaining <= 0 || a.settled) return false;
+      if (!t) return true;
+      if (a.key.toLowerCase().includes(t)) return true;
+      return a.guests.some(
+        (g) =>
+          g.name.toLowerCase().includes(t) ||
+          g.roomNo.toLowerCase().includes(t),
+      );
+    });
+  }, [accounts, q]);
+
+  const openDue = accounts.reduce(
+    (s, a) => s + Math.max(0, a.billed - a.collected),
+    0,
+  );
+  const searchHitRaw = lookupDueAccount(accounts, q);
+  const searchHit =
+    searchHitRaw && searchHitRaw.remaining > 0 ? searchHitRaw : null;
+  const sourceHints = useMemo(
+    () => uniqueSources(guests, receipts),
+    [guests, receipts],
+  );
+  const settled = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    return accounts.filter((a) => {
+      if (a.remaining > 0 && !a.settled) return false;
+      if (a.billed <= 0 && a.receipts.length === 0) return false;
+      if (!t) return true;
+      if (a.key.toLowerCase().includes(t)) return true;
+      return a.guests.some(
+        (g) =>
+          g.name.toLowerCase().includes(t) ||
+          g.roomNo.toLowerCase().includes(t),
+      );
+    });
+  }, [accounts, q]);
+  const listed = useMemo(
+    () =>
+      searchHit
+        ? filtered.filter((a) => a.key !== searchHit.key)
+        : filtered,
+    [filtered, searchHit],
+  );
+  const otherRows = receipts
+    .filter((r) => r.kind === "other")
+    .slice()
+    .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
+  const listRows = receipts
+    .filter((r) => r.kind === "list")
+    .slice()
+    .sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
+  const otherToday = otherRows
+    .filter((r) => r.date === date)
+    .reduce((s, r) => s + r.amount, 0);
+  const otherTotal = otherRows.reduce((s, r) => s + r.amount, 0);
+  const monthKey = (asOn || date).slice(0, 7);
+  const monthName = /^\d{4}-\d{2}$/.test(monthKey)
+    ? format(parseISO(`${monthKey}-01`), "MMMM yyyy")
+    : monthKey;
+  const monthBills = useMemo(
+    () =>
+      guestsAsOf
+        .filter((g) => g.mode === "BALANCE" && g.date.startsWith(monthKey))
+        .map((g) => ({
+          id: g.id,
+          date: g.date,
+          source: sourceKey(g),
+          name: g.name,
+          roomNo: g.roomNo,
+          amount: g.amount,
+        }))
+        .sort(
+          (a, b) =>
+            a.date.localeCompare(b.date) ||
+            a.source.localeCompare(b.source) ||
+            a.name.localeCompare(b.name),
+        ),
+    [guestsAsOf, monthKey],
+  );
+  const monthReceipts = useMemo(
+    () =>
+      receiptsAsOf
+        .filter(
+          (r) =>
+            r.date.startsWith(monthKey) &&
+            r.kind !== "ota" &&
+            r.kind !== "other" &&
+            r.kind !== "list",
+        )
+        .slice()
+        .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id)),
+    [receiptsAsOf, monthKey],
+  );
+  const monthBilled = monthBills.reduce((s, row) => s + row.amount, 0);
+  const monthCollected = monthReceipts.reduce((s, row) => s + row.amount, 0);
+
+  function refuseLocked(day: string) {
+    if (!isDayLocked(lockedDates, day)) return false;
+    tellDateLocked(day);
+    return true;
+  }
+
+  function collectFrom(
+    account: DueAccount,
+    mode: PayMode,
+    amount: number,
+    payRef?: string,
+  ) {
+    if (refuseLocked(date)) return;
+    gate(
+      () => {
+        const ok = addBalReceived({
+          particular: account.key,
+          forKey: account.key,
+          mode,
+          amount,
+          kind: "due",
+          payRef: payRef?.trim() || null,
+        });
+        if (!ok) {
+          tellDateLocked(date);
+          return;
+        }
+        toast.success(`Collected ${money(amount)} from ${account.key}`);
+      },
+      {
+        title: "Are you sure?",
+        message: `Collect ${money(amount)} from ${account.key}? Oldest open stays will tick Paid first.`,
+        confirmLabel: "Collect",
+      },
+    );
+  }
+
+  function removeReceipt(id: string) {
+    const receipt = receipts.find((r) => r.id === id);
+    if (receipt && refuseLocked(receipt.date)) return;
+    gate(
+      () => {
+        const ok = removeBalReceived(id, { bypass: true });
+        if (!ok) {
+          toast.error("This receipt could not be deleted");
+          return;
+        }
+        const name = (receipt?.forKey || receipt?.particular || "This source").trim();
+        toast.success(
+          `Receipt deleted. ${name} is back on the Balance list if any amount is still due.`,
+        );
+      },
+      {
+        title: "Delete this receipt?",
+        message:
+          "The amount will leave Cash, Santosh QR or P.K. QR, and the balance will show again if it is not fully received.",
+        confirmLabel: "Delete",
+        danger: true,
+        requireCode: true,
+      },
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted">
+          Outstanding
+        </p>
+        <h1 className="mt-1 font-display text-3xl font-semibold tracking-tight">
+          Balance
+        </h1>
+        <p className="mt-1 text-sm text-muted">
+          {asOn
+            ? `Balances as on ${formatDay(asOn)}. September ends on 30, not 31.`
+            : "Live balances. Pick a date to see who owed what on that day."}
+        </p>
+      </div>
+      {write && !asOn ? <SaveCube busy={saving} onSave={() => void saveToServer()} /> : null}
+      </div>
+
+      <div className="flex flex-wrap items-end gap-2">
+        <div className="grid gap-1.5">
+          <label htmlFor="balance-as-on" className="text-xs font-medium text-muted">
+            Balance as on
+          </label>
+          <Input
+            id="balance-as-on"
+            type="date"
+            value={asOn}
+            max="2026-12-31"
+            onChange={(e) => setAsOn(e.target.value)}
+          />
+        </div>
+        <Button type="button" variant="outline" onClick={() => setAsOn("2026-09-30")}>
+          30 Sep 2026
+        </Button>
+        <Button type="button" variant="outline" onClick={() => setAsOn("")} disabled={!asOn}>
+          Live
+        </Button>
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Card className="p-4">
+          <div className="text-xs font-medium text-muted">Books C/B</div>
+          <div className="mt-1 font-display text-2xl font-semibold tabular text-due">
+            {money(books?.outstanding.cb ?? 0)}
+          </div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs font-medium text-muted">Open source dues</div>
+          <div className="mt-1 font-display text-2xl font-semibold tabular">
+            {money(openDue)}
+          </div>
+        </Card>
+        <Card
+          className={cn(
+            "cursor-pointer p-4 text-left",
+            sheet === "billed" && "ring-1 ring-primary",
+          )}
+          role="button"
+          tabIndex={0}
+          onClick={() => setSheet((open) => (open === "billed" ? null : "billed"))}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            setSheet((open) => (open === "billed" ? null : "billed"));
+          }}
+        >
+          <div className="text-xs font-medium text-muted">{monthName} billed</div>
+          <div className="mt-1 font-display text-2xl font-semibold tabular">
+            {money(monthBilled)}
+          </div>
+          <div className="mt-1 text-[11px] text-muted">
+            {monthBills.length} bill{monthBills.length === 1 ? "" : "s"} · tap for the list
+          </div>
+        </Card>
+        <Card
+          className={cn(
+            "cursor-pointer p-4 text-left",
+            sheet === "collected" && "ring-1 ring-primary",
+          )}
+          role="button"
+          tabIndex={0}
+          onClick={() => setSheet((open) => (open === "collected" ? null : "collected"))}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" && event.key !== " ") return;
+            event.preventDefault();
+            setSheet((open) => (open === "collected" ? null : "collected"));
+          }}
+        >
+          <div className="text-xs font-medium text-muted">{monthName} collected</div>
+          <div className="mt-1 font-display text-2xl font-semibold tabular text-ok">
+            {money(monthCollected)}
+          </div>
+          <div className="mt-1 text-[11px] text-muted">
+            {monthReceipts.length} receipt{monthReceipts.length === 1 ? "" : "s"} · tap for the list
+          </div>
+        </Card>
+      </div>
+
+      {sheet === "billed" ? (
+        <Card className="overflow-x-auto">
+          <div className="flex items-end justify-between gap-3 px-4 pt-4">
+            <div>
+              <p className="font-display text-lg font-semibold">{monthName} bills</p>
+              <p className="text-sm text-muted">
+                Who was billed on balance this month · {money(monthBilled)}
+              </p>
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={() => setSheet(null)}>
+              Close
+            </Button>
+          </div>
+          <table className="mt-3 w-full min-w-[36rem] text-left text-sm">
+            <thead className="text-[11px] uppercase tracking-wide text-muted">
+              <tr className="border-y border-border">
+                <th className="px-4 py-2 font-medium">Date</th>
+                <th className="px-3 py-2 font-medium">Source</th>
+                <th className="px-3 py-2 font-medium">Guest</th>
+                <th className="px-3 py-2 font-medium">Room</th>
+                <th className="px-4 py-2 text-right font-medium">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              {monthBills.map((row) => (
+                <tr key={row.id} className="border-b border-border/70">
+                  <td className="px-4 py-2.5 tabular">{formatDayShort(row.date)}</td>
+                  <td className="px-3 py-2.5 font-medium">{row.source}</td>
+                  <td className="px-3 py-2.5">{row.name}</td>
+                  <td className="px-3 py-2.5 tabular">{row.roomNo}</td>
+                  <td className="px-4 py-2.5 text-right tabular">{money(row.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {monthBills.length === 0 ? (
+            <p className="px-4 py-8 text-center text-sm text-muted">No balance bills this month.</p>
+          ) : null}
+        </Card>
+      ) : null}
+
+      {sheet === "collected" ? (
+        <Card className="overflow-x-auto">
+          <div className="flex items-end justify-between gap-3 px-4 pt-4">
+            <div>
+              <p className="font-display text-lg font-semibold">{monthName} collected</p>
+              <p className="text-sm text-muted">
+                Who paid this month, and how much · {money(monthCollected)}
+              </p>
+            </div>
+            <Button type="button" variant="outline" size="sm" onClick={() => setSheet(null)}>
+              Close
+            </Button>
+          </div>
+          <table className="mt-3 w-full min-w-[36rem] text-left text-sm">
+            <thead className="text-[11px] uppercase tracking-wide text-muted">
+              <tr className="border-y border-border">
+                <th className="px-4 py-2 font-medium">Date</th>
+                <th className="px-3 py-2 font-medium">Source</th>
+                <th className="px-3 py-2 font-medium">Paid by</th>
+                <th className="px-3 py-2 font-medium">Reference</th>
+                <th className="px-4 py-2 text-right font-medium">Amount</th>
+              </tr>
+            </thead>
+            <tbody>
+              {monthReceipts.map((row) => (
+                <tr key={row.id} className="border-b border-border/70">
+                  <td className="px-4 py-2.5 tabular">{formatDayShort(row.date)}</td>
+                  <td className="px-3 py-2.5 font-medium">{(row.forKey || row.particular).trim()}</td>
+                  <td className="px-3 py-2.5">{MODE_LABEL[row.mode]}</td>
+                  <td className="px-3 py-2.5 font-mono text-xs">{row.payRef || "—"}</td>
+                  <td className="px-4 py-2.5 text-right tabular text-ok">{money(row.amount)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {monthReceipts.length === 0 ? (
+            <p className="px-4 py-8 text-center text-sm text-muted">Nothing collected this month.</p>
+          ) : null}
+        </Card>
+      ) : null}
+
+      <Tabs defaultValue="balance">
+        <TabsList aria-label="Balance sections">
+          <TabsTrigger value="balance">
+            Balance
+          </TabsTrigger>
+          <TabsTrigger value="other">
+            Other
+          </TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="balance" className="flex flex-col gap-5">
+          <div className="flex flex-col gap-3">
+            <div className="relative min-w-0">
+              <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted" />
+              <Input
+                className="pl-9"
+                placeholder="Source or guest — Flysky, Motor, name"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                aria-label="Search dues"
+                list="balance-source-hints"
+                autoComplete="off"
+              />
+              <datalist id="balance-source-hints">
+                {sourceHints.map((s) => (
+                  <option key={s} value={s} />
+                ))}
+              </datalist>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  if (filtered.length === 0) {
+                    toast.error("No open sources to print");
+                    return;
+                  }
+                  toast.message("Opening source print…");
+                  printSourceSummary(filtered, hotel.name, hotel.place);
+                }}
+              >
+                <Printer className="size-4" />
+                Print sources
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <div>
+              <p className="font-display text-lg font-semibold tracking-tight">
+                Open sources
+              </p>
+              <p className="text-sm text-muted">
+                {listed.length} live balance
+                {listed.length === 1 ? "" : "s"} · due {money(openDue)}
+              </p>
+            </div>
+
+          {searchHit ? (
+            <p className="text-sm text-muted">
+              <span className="font-medium text-fg">{searchHit.key}</span>
+              {" · "}
+              {searchHit.guestCount} guest
+              {searchHit.guestCount === 1 ? "" : "s"}
+              {" · "}
+              {searchHit.stays.length} stay
+              {searchHit.stays.length === 1 ? "" : "s"}
+              {" · billed "}
+              {money(searchHit.billed)}
+              {" · due "}
+              {money(Math.max(0, searchHit.remaining))}
+            </p>
+          ) : null}
+
+          {searchHit ? (
+            <SourceCard
+              account={searchHit}
+              open
+              pinned
+              month={date.slice(0, 7)}
+              onToggle={() => setQ("")}
+              onCollect={(mode, amount, payRef) =>
+                collectFrom(searchHit, mode, amount, payRef)
+              }
+              onRemoveReceipt={removeReceipt}
+              lockedDates={lockedDates}
+              onPrintGuests={() => {
+                toast.message("Opening guest print…");
+                printSourceGuests(searchHit, hotel.name, hotel.place);
+              }}
+              write={write && !asOn}
+            />
+          ) : null}
+
+          <div className="flex flex-col gap-2">
+            {listed.map((account) => (
+              <SourceCard
+                key={account.key}
+                account={account}
+                open={openKey === account.key}
+                month={date.slice(0, 7)}
+                onToggle={() =>
+                  setOpenKey((k) => (k === account.key ? null : account.key))
+                }
+                onCollect={(mode, amount, payRef) =>
+                  collectFrom(account, mode, amount, payRef)
+                }
+                onRemoveReceipt={removeReceipt}
+                lockedDates={lockedDates}
+                onPrintGuests={() => {
+                  toast.message("Opening guest print…");
+                  printSourceGuests(account, hotel.name, hotel.place);
+                }}
+                write={write && !asOn}
+              />
+            ))}
+            {listed.length === 0 && !searchHit ? (
+              <Card className="p-8 text-center text-sm text-muted">
+                No source dues match this filter.
+              </Card>
+            ) : null}
+          </div>
+          </div>
+
+          {settled.length > 0 ? (
+            <div className="flex flex-col gap-2">
+              <div>
+                <p className="font-display text-lg font-semibold tracking-tight">
+                  Received
+                </p>
+                <p className="text-sm text-muted">
+                  These are fully received. Delete a receipt and the balance
+                  comes back on the list above if any amount is still due.
+                </p>
+              </div>
+              {settled.map((account) => (
+                <SourceCard
+                  key={account.key}
+                  account={account}
+                  open={openKey === account.key}
+                  month={date.slice(0, 7)}
+                  onToggle={() =>
+                    setOpenKey((k) => (k === account.key ? null : account.key))
+                  }
+                  onCollect={(mode, amount, payRef) =>
+                    collectFrom(account, mode, amount, payRef)
+                  }
+                  onRemoveReceipt={removeReceipt}
+                  lockedDates={lockedDates}
+                  onPrintGuests={() => {
+                    toast.message("Opening guest print…");
+                    printSourceGuests(account, hotel.name, hotel.place);
+                  }}
+                  write={write && !asOn}
+                />
+              ))}
+            </div>
+          ) : null}
+        </TabsContent>
+
+        <TabsContent value="other" className="flex flex-col gap-5">
+          <OtherTab
+            booksCb={books?.outstanding.cb ?? 0}
+            today={otherToday}
+            total={otherTotal}
+            sources={sourceHints}
+            listRows={listRows}
+            rows={otherRows}
+            onAddList={(source, amount) => {
+              if (refuseLocked(date)) return;
+              gate(
+                () => {
+                  const ok = addBalReceived({
+                    particular: source.trim(),
+                    mode: "BALANCE",
+                    amount,
+                    kind: "list",
+                  });
+                  if (!ok) {
+                    tellDateLocked(date);
+                    return;
+                  }
+                  toast.success(`${source.trim()} added to the Balance list`);
+                },
+                {
+                  title: "Add this source to the Balance list?",
+                  message: `${source.trim()} · ${money(amount)}. Books outstanding will not change.`,
+                  confirmLabel: "Add to list",
+                },
+              );
+            }}
+            onReceive={(source, mode, amount, payRef) => {
+              if (refuseLocked(date)) return;
+              const account = lookupDueAccount(accounts, source);
+              if (!account || account.remaining <= 0) {
+                toast.error("No open balance found for this name");
+                return;
+              }
+              gate(
+                () => {
+                  const ok = addBalReceived({
+                    particular: account.key,
+                    forKey: account.key,
+                    mode,
+                    amount,
+                    kind: "due",
+                    payRef: payRef?.trim() || null,
+                  });
+                  if (!ok) {
+                    tellDateLocked(date);
+                    return;
+                  }
+                  toast.success(`Received ${money(amount)} from ${account.key}`);
+                },
+                {
+                  title: "Receive this amount?",
+                  message: `Cut ${money(amount)} from ${account.key}. Cash, Santosh QR or P.K. QR — it will show in that book.`,
+                  confirmLabel: "Receive",
+                },
+              );
+            }}
+            onAdd={(mode, amount, note, payRef) => {
+              if (refuseLocked(date)) return;
+              gate(
+                () => {
+                  const ok = addBalReceived({
+                    particular: note.trim() ? `Other · ${note.trim()}` : "Other",
+                    mode,
+                    amount,
+                    kind: "other",
+                    payRef: payRef?.trim() || null,
+                  });
+                  if (!ok) {
+                    tellDateLocked(date);
+                    return;
+                  }
+                  toast.success(`Other ${money(amount)} saved`);
+                },
+                {
+                  title: "Save this Other entry?",
+                  message: `Other ${money(amount)}. It will not show on the Balance list.`,
+                  confirmLabel: "Save",
+                },
+              );
+            }}
+            onRemove={(id) => {
+              const row = receipts.find((r) => r.id === id);
+              if (row && refuseLocked(row.date)) return;
+              gate(
+                () => {
+                  removeBalReceived(id);
+                  toast.success("Entry removed");
+                },
+                {
+                  title: "Delete this entry?",
+                  message: "Remove this amount?",
+                  confirmLabel: "Delete",
+                  danger: true,
+                },
+              );
+            }}
+            write={write}
+            lockedDates={lockedDates}
+          />
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
+
+function OtherTab({
+  booksCb,
+  today,
+  total,
+  sources,
+  listRows,
+  rows,
+  onAddList,
+  onReceive,
+  onAdd,
+  onRemove,
+  write = true,
+  lockedDates,
+}: {
+  booksCb: number;
+  today: number;
+  total: number;
+  sources: string[];
+  listRows: { id: string; date: string; particular: string; mode: PayMode; amount: number }[];
+  rows: { id: string; date: string; particular: string; mode: PayMode; amount: number }[];
+  onAddList: (source: string, amount: number) => void;
+  onReceive: (source: string, mode: PayMode, amount: number, payRef?: string) => void;
+  onAdd: (mode: PayMode, amount: number, note: string, payRef?: string) => void;
+  onRemove: (id: string) => void;
+  write?: boolean;
+  lockedDates: Record<string, true>;
+}) {
+  const [listSource, setListSource] = useState("");
+  const [listAmount, setListAmount] = useState("");
+  const [recvSource, setRecvSource] = useState("");
+  const [recvMode, setRecvMode] = useState<PayMode>("CASH");
+  const [recvAmount, setRecvAmount] = useState("");
+  const [recvRef, setRecvRef] = useState("");
+  const [mode, setMode] = useState<PayMode>("CASH");
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
+  const [otherRef, setOtherRef] = useState("");
+
+  return (
+    <>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+        <Card className="p-4">
+          <div className="text-xs font-medium text-muted">Books outstanding</div>
+          <div className="mt-1 font-display text-2xl font-semibold tabular text-due">
+            {money(booksCb)}
+          </div>
+        </Card>
+        <Card className="p-4">
+          <div className="text-xs font-medium text-muted">Other today</div>
+          <div className="mt-1 font-display text-2xl font-semibold tabular">
+            {money(today)}
+          </div>
+        </Card>
+        <Card className="col-span-2 p-4 lg:col-span-1">
+          <div className="text-xs font-medium text-muted">Other posted</div>
+          <div className="mt-1 font-display text-2xl font-semibold tabular">
+            {money(total)}
+          </div>
+        </Card>
+      </div>
+
+      {write ? (
+      <Card>
+        <CardContent className="flex flex-col gap-4 p-5">
+          <div>
+            <p className="font-display text-lg font-semibold tracking-tight">
+              Add to list
+            </p>
+            <p className="mt-1 text-sm text-muted">
+              Source name + balance amount. Name shows on the main Balance list.
+              Books outstanding stays the same.
+            </p>
+          </div>
+          <form
+            className="grid gap-3 sm:grid-cols-[1fr_8rem_auto]"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const src = listSource.trim();
+              const amt = Number(listAmount);
+              if (!src) {
+                toast.error("Enter a source name");
+                return;
+              }
+              if (!Number.isFinite(amt) || amt <= 0) {
+                toast.error("Enter an amount");
+                return;
+              }
+              onAddList(src, amt);
+              setListSource("");
+              setListAmount("");
+            }}
+          >
+            <div className="grid gap-1.5">
+              <Label htmlFor="list-source">Source</Label>
+              <Input
+                id="list-source"
+                value={listSource}
+                onChange={(e) => setListSource(e.target.value)}
+                placeholder="Company / source name"
+                list="balance-list-sources"
+                autoComplete="off"
+              />
+              <datalist id="balance-list-sources">
+                {sources.map((s) => (
+                  <option key={s} value={s} />
+                ))}
+              </datalist>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Balance amount</Label>
+              <Input
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                value={listAmount}
+                onChange={(e) => setListAmount(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            <div className="flex items-end">
+              <Button type="submit" className="w-full">
+                Add to list
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+      ) : null}
+
+      {listRows.length > 0 ? (
+        <Card>
+          <CardContent className="overflow-x-auto p-0">
+            <table className="w-full min-w-[32rem] text-left text-sm">
+              <thead className="text-xs uppercase tracking-wide text-muted">
+                <tr className="border-y border-border">
+                  <th className="px-5 py-2 font-medium">Date</th>
+                  <th className="px-3 py-2 font-medium">Source</th>
+                  <th className="px-3 py-2 text-right font-medium">List amount</th>
+                  <th className="px-3 py-2" />
+                </tr>
+              </thead>
+              <tbody>
+                {listRows.map((r) => (
+                  <tr key={r.id} className="border-b border-border/70">
+                    <td className="px-5 py-2.5 tabular text-muted">
+                      {formatDayShort(r.date)}
+                    </td>
+                    <td className="px-3 py-2.5">{r.particular}</td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(r.amount)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right">
+                      {write && !isDayLocked(lockedDates, r.date) ? (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-9 min-h-9 text-muted hover:text-danger"
+                        aria-label="Remove list entry"
+                        onClick={() => onRemove(r.id)}
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {write ? (
+      <Card>
+        <CardContent className="flex flex-col gap-4 p-5">
+          <div>
+            <p className="font-display text-lg font-semibold tracking-tight">
+              Receive
+            </p>
+            <p className="mt-1 text-sm text-muted">
+              Source + paid by + amount. Normal cut from that source. Then press
+              Save.
+            </p>
+          </div>
+          <form
+            className="grid gap-3 sm:grid-cols-[1fr_9rem_8rem_1fr_auto]"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const src = recvSource.trim();
+              const amt = Number(recvAmount);
+              if (!src) {
+                toast.error("Enter a source name");
+                return;
+              }
+              if (!Number.isFinite(amt) || amt <= 0) {
+                toast.error("Enter an amount");
+                return;
+              }
+              onReceive(src, recvMode, amt, recvRef);
+              setRecvSource("");
+              setRecvAmount("");
+              setRecvRef("");
+            }}
+          >
+            <div className="grid gap-1.5">
+              <Label htmlFor="recv-source">Source</Label>
+              <Input
+                id="recv-source"
+                value={recvSource}
+                onChange={(e) => setRecvSource(e.target.value)}
+                placeholder="Company / source name"
+                list="balance-recv-sources"
+                autoComplete="off"
+              />
+              <datalist id="balance-recv-sources">
+                {sources.map((s) => (
+                  <option key={s} value={s} />
+                ))}
+              </datalist>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Paid by</Label>
+              <Select value={recvMode} onValueChange={(v) => setRecvMode(v as PayMode)}>
+                <SelectTrigger aria-label="Receive payment mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {DUE_PAY_MODES.map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {MODE_LABEL[m]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Received</Label>
+              <Input
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                value={recvAmount}
+                onChange={(e) => setRecvAmount(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="recv-ref">Payment reference number</Label>
+              <Input
+                id="recv-ref"
+                value={recvRef}
+                onChange={(e) => setRecvRef(e.target.value)}
+                placeholder="UPI / cheque / ref"
+                autoComplete="off"
+              />
+            </div>
+            <div className="flex items-end">
+              <Button type="submit" className="w-full">
+                Receive
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+      ) : null}
+
+      {write ? (
+      <Card>
+        <CardContent className="flex flex-col gap-4 p-5">
+          <div>
+            <p className="font-display text-lg font-semibold tracking-tight">
+              Other
+            </p>
+            <p className="mt-1 text-sm text-muted">
+              Amount + note. Name stays Other. It does not appear on the Balance
+              list.
+            </p>
+          </div>
+          <form
+            className="grid gap-3 sm:grid-cols-[9rem_8rem_1fr_auto]"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const amt = Number(amount);
+              if (!Number.isFinite(amt) || amt <= 0) {
+                toast.error("Enter an amount");
+                return;
+              }
+              onAdd(mode, amt, note, mode === "QRPK" ? otherRef.trim() : "");
+              setAmount("");
+              setNote("");
+              setOtherRef("");
+            }}
+          >
+            <div className="grid gap-1.5">
+              <Label>Paid by</Label>
+              <Select value={mode} onValueChange={(v) => setMode(v as PayMode)}>
+                <SelectTrigger aria-label="Other payment mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {DUE_PAY_MODES.map((m) => (
+                    <SelectItem key={m} value={m}>
+                      {MODE_LABEL[m]}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-1.5">
+              <Label>Amount</Label>
+              <Input
+                type="text"
+                inputMode="decimal"
+                autoComplete="off"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                placeholder="0"
+              />
+            </div>
+            <div className="grid gap-1.5">
+              <Label htmlFor="other-note">Note</Label>
+              <Input
+                id="other-note"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="Optional"
+              />
+            </div>
+            {mode === "QRPK" ? (
+              <div className="grid gap-1.5 sm:col-span-2">
+                <Label htmlFor="other-ref">P.K. QR reference number</Label>
+                <Input
+                  id="other-ref"
+                  value={otherRef}
+                  onChange={(e) => setOtherRef(e.target.value)}
+                  placeholder="Bank Chq / Ref no."
+                  autoComplete="off"
+                />
+              </div>
+            ) : null}
+            <div className="flex items-end">
+              <Button type="submit" className="w-full">
+                Save
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+      ) : null}
+
+      <Card>
+        <CardContent className="overflow-x-auto p-0">
+          <table className="w-full min-w-[32rem] text-left text-sm">
+            <thead className="text-xs uppercase tracking-wide text-muted">
+              <tr className="border-y border-border">
+                <th className="px-5 py-2 font-medium">Date</th>
+                <th className="px-3 py-2 font-medium">Note</th>
+                <th className="px-3 py-2 font-medium">Paid by</th>
+                <th className="px-3 py-2 text-right font-medium">Amount</th>
+                <th className="px-3 py-2" />
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id} className="border-b border-border/70">
+                  <td className="px-5 py-2.5 tabular text-muted">
+                    {formatDayShort(r.date)}
+                  </td>
+                  <td className="px-3 py-2.5">{r.particular}</td>
+                  <td className="px-3 py-2.5">
+                    <ModeBadge mode={r.mode} />
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular">
+                    {money(r.amount)}
+                  </td>
+                  <td className="px-3 py-2.5 text-right">
+                    {write && !isDayLocked(lockedDates, r.date) ? (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 min-h-9 text-muted hover:text-danger"
+                      aria-label="Remove other entry"
+                      onClick={() => onRemove(r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    ) : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {rows.length === 0 ? (
+            <p className="py-10 text-center text-sm text-muted">
+              No Other entries yet.
+            </p>
+          ) : null}
+        </CardContent>
+      </Card>
+    </>
+  );
+}
+
+function SourceCard({
+  account,
+  open,
+  pinned,
+  month,
+  onToggle,
+  onCollect,
+  onRemoveReceipt,
+  onPrintGuests,
+  write = true,
+  lockedDates,
+}: {
+  account: DueAccount;
+  open: boolean;
+  pinned?: boolean;
+  month: string;
+  onToggle: () => void;
+  onCollect: (mode: PayMode, amount: number, payRef?: string) => void;
+  onRemoveReceipt: (id: string) => void;
+  onPrintGuests: () => void;
+  write?: boolean;
+  lockedDates: Record<string, true>;
+}) {
+  const [mode, setMode] = useState<PayMode>("CASH");
+  const [amount, setAmount] = useState("");
+  const [payRef, setPayRef] = useState("");
+  const shown = open || pinned;
+  const carried =
+    !account.settled && Boolean(account.lastDate) && account.lastDate.slice(0, 7) < month;
+
+  return (
+    <Card className={cn("overflow-hidden", pinned && "ring-1 ring-primary/30")}>
+      <div className="flex w-full min-h-14 flex-wrap items-center gap-2 px-4 py-3 md:px-5">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={shown}
+          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+        >
+          <ChevronDown
+            className={cn(
+              "size-4 shrink-0 text-muted transition-transform duration-150",
+              shown ? "rotate-0" : "-rotate-90",
+            )}
+          />
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-display text-lg font-semibold tracking-tight">
+              {account.key}
+            </div>
+            <div className="text-xs text-muted">
+              {account.guestCount} guest{account.guestCount === 1 ? "" : "s"} ·{" "}
+              {account.stays.length} stay{account.stays.length === 1 ? "" : "s"} ·{" "}
+              {account.nights} night{account.nights === 1 ? "" : "s"}
+              {account.listBilled > 0 ? ` · list ${money(account.listBilled)}` : ""}
+              {account.firstDate
+                ? ` · ${formatDayShort(account.firstDate)}–${formatDayShort(account.lastDate)}`
+                : ""}
+            </div>
+          </div>
+        </button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="shrink-0"
+          onClick={onPrintGuests}
+        >
+          <Printer className="size-4" />
+          Print guests
+        </Button>
+        <div className="text-right">
+          <div
+            className={cn(
+              "font-display text-xl font-semibold tabular",
+              account.settled ? "text-ok" : "text-due",
+            )}
+          >
+            {money(Math.max(0, account.remaining))}
+          </div>
+          <Badge variant={account.settled ? "ok" : "warn"}>
+            {account.settled ? "Settled" : carried ? "Carried" : "Open"}
+          </Badge>
+        </div>
+      </div>
+
+      {shown ? (
+        <CardContent className="border-t border-border pt-4">
+          <div className="-mx-5 overflow-x-auto">
+            <table className="w-full min-w-[52rem] text-left text-sm">
+              <thead className="text-xs uppercase tracking-wide text-muted">
+                <tr className="border-b border-border">
+                  <th className="px-5 py-2 font-medium"> </th>
+                  <th className="px-3 py-2 font-medium">Guest</th>
+                  <th className="px-3 py-2 font-medium">Check-in</th>
+                  <th className="px-3 py-2 font-medium">Check-out</th>
+                  <th className="px-3 py-2 text-right font-medium">Nights</th>
+                  <th className="px-3 py-2 text-right font-medium">Per day</th>
+                  <th className="px-3 py-2 text-right font-medium">Total</th>
+                  <th className="px-5 py-2 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {account.stays.filter((stay) => stay.status !== "paid").map((stay) => (
+                  <tr
+                    key={stay.id}
+                    className={cn(
+                      "border-b border-border/70",
+                      stay.status === "paid" && "bg-ok/5",
+                    )}
+                  >
+                    <td className="px-5 py-2.5">
+                      <PaidTick stay={stay} />
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="font-medium">{stay.name}</div>
+                      <div className="text-xs text-muted">Room {stay.roomNo}</div>
+                    </td>
+                    <td className="px-3 py-2.5 tabular">
+                      {stayStamp(stay.checkIn)}
+                    </td>
+                    <td className="px-3 py-2.5 tabular text-muted">
+                      {checkoutLabel(stay)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right tabular">{stay.days}</td>
+                    <td className="px-3 py-2.5 text-right tabular">
+                      {money(stay.perDay)}
+                    </td>
+                    <td className="px-3 py-2.5 text-right tabular font-medium">
+                      {money(stay.remaining)}
+                    </td>
+                    <td className="px-5 py-2.5">
+                      <StayStatus stay={stay} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {account.stays.length === 0 ? (
+              <p className="px-5 py-4 text-sm text-muted">
+                {account.listBilled > 0
+                  ? `List opening ${money(account.listBilled)}. Receive cuts this source.`
+                  : "No guest stays on this source."}
+              </p>
+            ) : null}
+          </div>
+
+          <div className="mt-3 flex flex-wrap justify-between gap-2 text-sm">
+            <span className="text-muted">
+              {account.guestCount} guests · billed {money(account.billed)} · paid{" "}
+              {money(account.collected)}
+            </span>
+            <span className="font-semibold tabular">
+              Due {money(Math.max(0, account.remaining))}
+            </span>
+          </div>
+
+          {account.receipts.length > 0 ? (
+            <ul className="mt-3 divide-y divide-border rounded-lg border border-border">
+              {account.receipts.map((r) => (
+                <li
+                  key={r.id}
+                  className="flex items-center justify-between gap-3 px-3 py-2"
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm">
+                      {formatDayShort(r.date)} · {r.particular}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <ModeBadge mode={r.mode} />
+                      {r.payRef ? (
+                        <span className="text-xs text-muted">Ref {r.payRef}</span>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <span className="tabular text-sm font-medium text-ok">
+                      {money(r.amount)}
+                    </span>
+                    {write && !isDayLocked(lockedDates, r.date) ? (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-9 min-h-9 text-muted hover:text-danger"
+                      aria-label="Remove collection"
+                      onClick={() => onRemoveReceipt(r.id)}
+                    >
+                      <Trash2 className="size-4" />
+                    </Button>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          {write && !account.settled ? (
+            <form
+              className="mt-4 grid gap-3 sm:grid-cols-[9rem_1fr_1fr_auto]"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const amt = Number(amount || Math.max(0, account.remaining));
+                if (!Number.isFinite(amt) || amt <= 0) {
+                  toast.error("Enter an amount to collect");
+                  return;
+                }
+                onCollect(mode, amt, payRef);
+                setAmount("");
+                setPayRef("");
+              }}
+            >
+              <div className="grid gap-1.5">
+                <Label>Mode</Label>
+                <Select
+                  value={mode}
+                  onValueChange={(v) => setMode(v as PayMode)}
+                >
+                  <SelectTrigger aria-label="Collection mode">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {DUE_PAY_MODES.map((m) => (
+                      <SelectItem key={m} value={m}>
+                        {MODE_LABEL[m]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-1.5">
+                <Label>Amount</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  placeholder={String(Math.max(0, account.remaining))}
+                />
+              </div>
+              <div className="grid gap-1.5">
+                <Label htmlFor={`pay-ref-${account.key}`}>Payment reference number</Label>
+                <Input
+                  id={`pay-ref-${account.key}`}
+                  value={payRef}
+                  onChange={(e) => setPayRef(e.target.value)}
+                  placeholder="UPI / cheque / ref"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="flex items-end">
+                <Button type="submit" className="w-full">
+                  Collect
+                </Button>
+              </div>
+            </form>
+          ) : account.settled ? (
+            <p className="mt-4 text-sm text-ok">
+              This source is settled. Every stay is ticked Paid.
+            </p>
+          ) : null}
+        </CardContent>
+      ) : null}
+    </Card>
+  );
+}
+
+function PaidTick({ stay }: { stay: DueStay }) {
+  const on = stay.status === "paid";
+  return (
+    <span
+      className={cn(
+        "grid size-7 place-items-center rounded-md border",
+        on
+          ? "border-ok/40 bg-ok text-primary-fg"
+          : stay.status === "partial"
+            ? "border-due/40 bg-due/10 text-due"
+            : "border-border bg-card text-transparent",
+      )}
+      aria-label={dueStatusLabel(stay.status)}
+    >
+      <Check className="size-3.5" strokeWidth={3} />
+    </span>
+  );
+}
+
+function StayStatus({ stay }: { stay: DueStay }) {
+  if (stay.status === "paid") {
+    return <Badge variant="ok">Paid</Badge>;
+  }
+  if (stay.status === "partial") {
+    return (
+      <div className="flex flex-col gap-0.5">
+        <Badge variant="warn">Partial</Badge>
+        <span className="text-xs tabular text-muted">
+          Due {money(stay.remaining)}
+        </span>
+      </div>
+    );
+  }
+  return <Badge variant="warn">Open</Badge>;
+}

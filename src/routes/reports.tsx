@@ -1,0 +1,764 @@
+import { useMemo, useState } from "react";
+import { createFileRoute } from "@tanstack/react-router";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import { format, isValid, parseISO } from "date-fns";
+import { Printer, Download } from "lucide-react";
+import { toast } from "sonner";
+import { DailyA4 } from "@/components/daily-a4";
+import { DayChart } from "@/components/day-chart";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { buildDayTake } from "@/lib/day-report";
+import { sumByBucket, expenseBucket } from "@/lib/expense-tally";
+import { formatDay, formatDayShort, money, moneyCompact } from "@/lib/format";
+import { printHtmlDocument } from "@/lib/print-sheet";
+import { downloadDayPack } from "@/lib/daily-pdf";
+import { downloadMonthPack } from "@/lib/month-pack-pdf";
+import { buildDueAccounts } from "@/lib/balance";
+import { REPORT_TAB, parseReportView } from "@/lib/report-views";
+import { useLedger, useDayBooks } from "@/lib/store";
+import { isPriorMonthClosed } from "@/lib/register-lock";
+import type { DayBooks } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+export const Route = createFileRoute("/reports")({
+  validateSearch: (search: Record<string, unknown>) => ({
+    view: parseReportView(search.view),
+  }),
+  component: ReportsPage,
+});
+
+function latestMarkFor(date: string, rows: { date?: string }[], openingDate: string) {
+  return [openingDate, date, ...rows.map((row) => row.date || "")]
+    .filter(Boolean)
+    .reduce((max, value) => (value > max ? value : max), openingDate || date);
+}
+
+function useMonthLock(date: string) {
+  const openMonths = useLedger((s) => s.openMonths);
+  const lockRev = useLedger((s) => s.lockRev);
+  const openingDate = useLedger((s) => s.openingDate);
+  const guests = useLedger((s) => s.guests);
+  const food = useLedger((s) => s.food);
+  const wholesale = useLedger((s) => s.wholesale);
+  const expenses = useLedger((s) => s.expenses);
+  const balReceived = useLedger((s) => s.balReceived);
+  const latest = latestMarkFor(
+    date,
+    [...guests, ...food, ...wholesale, ...expenses, ...balReceived],
+    openingDate,
+  );
+  const closed = isPriorMonthClosed(date, openMonths, latest, lockRev);
+  const first = `${date.slice(0, 7)}-01`;
+  const books = useDayBooks(first);
+  return { closed, first, books };
+}
+
+function LockedOpening({ first, books }: { first: string; books: DayBooks | undefined }) {
+  const monthName = format(parseISO(first), "MMMM");
+  const rows = [
+    ["Cash", books?.cashBook.ob],
+    ["Santosh QR", books?.santosh.ob],
+    ["P.K. QR", books?.pk.ob],
+    ["Online", books?.online.ob],
+    ["Balance", books?.outstanding.ob],
+  ] as const;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Opening balance · 1 {monthName}</CardTitle>
+        <p className="text-sm text-muted">
+          {monthName} is locked. This report shows only the 1st opening balance.
+          Unlock {monthName} in Register to open the full daily report. Nothing is deleted.
+        </p>
+      </CardHeader>
+      <CardContent className="grid grid-cols-2 gap-3 md:grid-cols-5">
+        {rows.map(([label, value]) => (
+          <div key={label} className="rounded-lg bg-bg-warm px-3 py-3">
+            <div className="text-xs font-medium text-muted">{label}</div>
+            <div className="mt-1 font-display text-xl font-semibold tabular">{money(value ?? 0)}</div>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+function ReportsPage() {
+  const { view } = Route.useSearch();
+  const navigate = Route.useNavigate();
+  const role = useLedger((s) => s.appRole);
+  if (role === "housekeeping") {
+    return (
+      <div className="flex flex-col gap-3">
+        <h1 className="font-display text-3xl font-semibold tracking-tight">Reports</h1>
+        <p className="text-sm text-muted">
+          Linen, WS and kitchen files stay in Inventory. Open Inventory to check them.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <Tabs
+      value={view}
+      onValueChange={(next) =>
+        void navigate({ search: { view: parseReportView(next) } })
+      }
+      className="flex flex-col gap-5"
+    >
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted">
+            Accounts
+          </p>
+          <h1 className="mt-1 font-display text-3xl font-semibold tracking-tight">
+            Reports
+          </h1>
+          <p className="mt-1 text-sm text-muted">
+            Day book, the detailed day, then the month.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <DayFileButton />
+          <MonthFileButton />
+        </div>
+        <TabsList className="flex h-auto min-h-11 w-full flex-wrap justify-start sm:w-auto">
+          {REPORT_TAB.map((tab) => (
+            <TabsTrigger key={tab.id} value={tab.id}>
+              {tab.label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </div>
+
+      <TabsContent value="daily" className="flex flex-col gap-5">
+        <DailyReportPanel />
+      </TabsContent>
+
+      <TabsContent value="detail" className="flex flex-col gap-5">
+        <DetailDailyPanel />
+      </TabsContent>
+
+      <TabsContent value="month" className="flex flex-col gap-5">
+        <MonthlyReportPanel />
+      </TabsContent>
+    </Tabs>
+  );
+}
+
+function DayFileButton() {
+  const date = useLedger((s) => s.selectedDate);
+  const hotel = useLedger((s) => s.hotel);
+  const allGuests = useLedger((s) => s.guests);
+  const allFood = useLedger((s) => s.food);
+  const allWs = useLedger((s) => s.wholesale);
+  const allExp = useLedger((s) => s.expenses);
+  const allRecv = useLedger((s) => s.balReceived);
+  const books = useDayBooks(date);
+  const [busy, setBusy] = useState(false);
+  const guests = allGuests.filter((g) => g.date === date);
+  const food = allFood.filter((f) => f.date === date);
+  const ws = allWs.filter((w) => w.date === date);
+  const expenses = allExp.filter((e) => e.date === date);
+  const receipts = allRecv.filter((r) => r.date === date);
+  const take = buildDayTake(guests, food, ws);
+
+  async function download() {
+    setBusy(true);
+    toast.message("Preparing the day file…");
+    try {
+      const openBalance = buildDueAccounts(
+        allGuests.filter((g) => g.date <= date),
+        allRecv.filter((r) => r.date <= date),
+      )
+        .filter((a) => a.remaining > 0 && !a.settled)
+        .map((a) => ({
+          source: a.key,
+          rooms: [...new Set(a.guests.map((g) => g.roomNo.trim()).filter(Boolean))].join(", "),
+          billed: a.billed,
+          paid: a.collected,
+          balance: Math.max(0, a.remaining),
+        }));
+      await downloadDayPack(
+        {
+          hotel: hotel.name,
+          blessing: hotel.blessing,
+          date,
+          books,
+          take,
+          expenses,
+          receipts,
+          guests: allGuests,
+          food,
+          ws,
+          openBalance,
+        },
+        `HSR-${date}.pdf`,
+      );
+      toast.success("Day file downloaded");
+    } catch {
+      toast.error("Could not download the day file");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => void download()}
+      disabled={busy}
+      className="min-w-36 rounded-2xl border border-[#1b332a] bg-[#1b332a] px-4 py-3 text-left text-[#f6f0e6] disabled:opacity-60"
+    >
+      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#f4c430]">
+        {formatDayShort(date)}
+      </div>
+      <div className="mt-1 flex items-center gap-2 font-display text-lg font-semibold">
+        <Download className="size-4" />
+        Day file
+      </div>
+      <div className="text-xs text-[#d7efe4]">Daily, detailed, balance</div>
+    </button>
+  );
+}
+
+function MonthFileButton() {
+  const date = useLedger((s) => s.selectedDate);
+  const hotel = useLedger((s) => s.hotel);
+  const guests = useLedger((s) => s.guests);
+  const food = useLedger((s) => s.food);
+  const wholesale = useLedger((s) => s.wholesale);
+  const expenses = useLedger((s) => s.expenses);
+  const receipts = useLedger((s) => s.balReceived);
+  const bankRows = useLedger((s) => s.bankRows);
+  const payrollFiles = useLedger((s) => s.payrollFiles);
+  const staff = useLedger((s) => s.staff);
+  const advances = useLedger((s) => s.advances);
+  const inventoryFiles = useLedger((s) => s.inventoryFiles);
+  const complaints = useLedger((s) => s.complaints);
+  const [busy, setBusy] = useState(false);
+  const from = `${date.slice(0, 7)}-01`;
+
+  async function download() {
+    setBusy(true);
+    toast.message("Preparing the month file…");
+    try {
+      await downloadMonthPack(
+        {
+          hotel: hotel.name,
+          blessing: hotel.blessing,
+          asOf: date,
+          guests,
+          food,
+          wholesale,
+          expenses,
+          receipts,
+          bankRows,
+          payrollFiles,
+          staff,
+          advances,
+          inventoryFiles,
+          complaints,
+        },
+        `HSR-${date.slice(0, 7)}-to-${date.slice(8)}.pdf`,
+      );
+      toast.success("Month file downloaded");
+    } catch {
+      toast.error("Could not download the month file");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => void download()}
+      disabled={busy}
+      className="min-w-36 rounded-2xl border border-[#1b332a] bg-[#1b332a] px-4 py-3 text-left text-[#f6f0e6] disabled:opacity-60"
+    >
+      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[#f4c430]">
+        {formatDayShort(from)} – {formatDayShort(date)}
+      </div>
+      <div className="mt-1 flex items-center gap-2 font-display text-lg font-semibold">
+        <Download className="size-4" />
+        Month file
+      </div>
+      <div className="text-xs text-[#d7efe4]">Salary, balance, stock</div>
+    </button>
+  );
+}
+
+function monthKey(iso: string) {
+  return iso.slice(0, 7);
+}
+
+function shiftMonth(key: string, by: number) {
+  const d = parseISO(`${key}-01`);
+  if (!isValid(d)) return key;
+  d.setMonth(d.getMonth() + by);
+  return format(d, "yyyy-MM");
+}
+
+function monthTitle(key: string, withYear: boolean) {
+  const d = parseISO(`${key}-01`);
+  if (!isValid(d)) return key;
+  return format(d, withYear ? "MMM yyyy" : "MMMM");
+}
+
+function MonthlyReportPanel() {
+  const days = useLedger((s) => s.days);
+  const guests = useLedger((s) => s.guests);
+  const food = useLedger((s) => s.food);
+  const wholesale = useLedger((s) => s.wholesale);
+  const expenses = useLedger((s) => s.expenses);
+  const hotel = useLedger((s) => s.hotel);
+  const selected = useLedger((s) => s.selectedDate);
+  const [picked, setPicked] = useState<string | null>(null);
+
+  const keys = new Set<string>();
+  for (const row of days) if (row.date) keys.add(monthKey(row.date));
+  for (const row of guests) if (row.date) keys.add(monthKey(row.date));
+  for (const row of food) if (row.date) keys.add(monthKey(row.date));
+  for (const row of wholesale) if (row.date) keys.add(monthKey(row.date));
+  for (const row of expenses) if (row.date) keys.add(monthKey(row.date));
+  if (selected) keys.add(monthKey(selected));
+  const months = [...keys].filter((key) => /^\d{4}-\d{2}$/.test(key)).sort();
+  const current = monthKey(selected);
+  const month =
+    picked && months.includes(picked)
+      ? picked
+      : months.includes(current)
+        ? current
+        : (months[months.length - 1] ?? current);
+  const withYear = new Set(months.map((key) => key.slice(0, 4))).size > 1;
+  const prevKey = shiftMonth(month, -1);
+
+  function pack(key: string) {
+    const dateSet = new Set<string>();
+    for (const row of days) if (monthKey(row.date) === key) dateSet.add(row.date);
+    for (const row of guests) if (monthKey(row.date) === key) dateSet.add(row.date);
+    for (const row of food) if (monthKey(row.date) === key) dateSet.add(row.date);
+    for (const row of wholesale) if (monthKey(row.date) === key) dateSet.add(row.date);
+    for (const row of expenses) if (monthKey(row.date) === key) dateSet.add(row.date);
+    const rows = [...dateSet].sort().map((date) => {
+      const take = buildDayTake(
+        guests.filter((g) => g.date === date),
+        food.filter((f) => f.date === date),
+        wholesale.filter((w) => w.date === date),
+      );
+      const vs = take.roomsTotal - hotel.dailyTarget;
+      return { date, take, vs, hit: take.roomsTotal >= hotel.dailyTarget };
+    });
+    const monthExpenses = expenses.filter((e) => monthKey(e.date) === key);
+    const expByDay = new Map<string, number>();
+    for (const e of monthExpenses) {
+      expByDay.set(e.date, (expByDay.get(e.date) ?? 0) + e.amount);
+    }
+    return {
+      rows,
+      expByDay,
+      sales: rows.reduce((s, r) => s + r.take.roomsTotal, 0),
+      food: rows.reduce((s, r) => s + r.take.foodTotal, 0),
+      ws: rows.reduce((s, r) => s + r.take.wsTotal, 0),
+      cash: rows.reduce((s, r) => s + r.take.cash.rooms, 0),
+      qr: rows.reduce((s, r) => s + r.take.santosh.rooms, 0),
+      pk: rows.reduce((s, r) => s + r.take.pk.rooms, 0),
+      online: rows.reduce((s, r) => s + r.take.online.rooms, 0),
+      due: rows.reduce((s, r) => s + r.take.due.rooms, 0),
+      hit: rows.filter((r) => r.hit).length,
+      buckets: sumByBucket(monthExpenses),
+      expTotal: monthExpenses.reduce((s, e) => s + e.amount, 0),
+      salary: monthExpenses
+        .filter((e) => expenseBucket(e.particular) === "salary")
+        .reduce((s, e) => s + e.amount, 0),
+    };
+  }
+
+  const now = pack(month);
+  const prev = pack(prevKey);
+  const label = monthTitle(month, withYear);
+  const prevLabel = monthTitle(prevKey, withYear);
+  const compare = [
+    { name: "Rooms", Prev: prev.sales, Now: now.sales },
+    { name: "Expenses", Prev: prev.expTotal, Now: now.expTotal },
+    { name: "Salary", Prev: prev.salary, Now: now.salary },
+  ];
+  const daily = now.rows.map((r) => ({
+    date: formatDayShort(r.date),
+    Cash: r.take.cash.rooms,
+    QR: r.take.santosh.rooms,
+    PK: r.take.pk.rooms,
+    Online: r.take.online.rooms,
+    Due: r.take.due.rooms,
+  }));
+
+  const lock = useMonthLock(`${month}-01`);
+
+  return (
+    <>
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted">
+            Month close
+          </p>
+          <h1 className="mt-1 font-display text-2xl font-semibold tracking-tight">
+            {label}
+          </h1>
+          <p className="mt-1 text-sm text-muted">
+            {lock.closed
+              ? `${label} is locked. Only the 1st opening balance is open.`
+              : `${now.hit} of ${now.rows.length} days hit the ₹60,000 target`}
+          </p>
+        </div>
+        <Button type="button" onClick={() => window.print()}>
+          <Printer className="size-4" />
+          Print
+        </Button>
+      </div>
+
+      <div className="flex flex-wrap gap-2 print:hidden">
+        {months.map((key) => (
+          <Button
+            key={key}
+            type="button"
+            size="sm"
+            variant={key === month ? "default" : "outline"}
+            onClick={() => setPicked(key)}
+          >
+            {monthTitle(key, withYear)}
+          </Button>
+        ))}
+      </div>
+
+      {lock.closed ? <LockedOpening first={lock.first} books={lock.books} /> : (
+      <>
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Stat label="Room sales" value={money(now.sales)} hint={`${prevLabel} ${money(prev.sales)}`} />
+        <Stat label="Expenses" value={money(now.expTotal)} hint={`${prevLabel} ${money(prev.expTotal)}`} />
+        <Stat label="Salary" value={money(now.salary)} hint={`${prevLabel} ${money(prev.salary)}`} />
+        <Stat
+          label="Flysky / WS"
+          value={money(now.buckets.flysky)}
+          hint={`WS exp ${money(now.buckets.ws)}`}
+        />
+      </div>
+
+      <div className="grid gap-3 sm:grid-cols-2 md:grid-cols-5">
+        <Mix label="Cash" value={now.cash} total={now.sales} />
+        <Mix label="Santosh QR" value={now.qr} total={now.sales} />
+        <Mix label="Praween QR" value={now.pk} total={now.sales} />
+        <Mix label="Online" value={now.online} total={now.sales} />
+        <Mix label="Balance" value={now.due} total={now.sales} />
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Day-wise book · {label}</CardTitle>
+          <p className="text-sm text-muted">
+            Same split as the Excel — cash, Santosh QR, Praween QR, online, due, food
+          </p>
+        </CardHeader>
+        <CardContent className="overflow-x-auto p-0">
+          <table className="w-full min-w-[52rem] text-left text-sm">
+            <thead className="text-xs uppercase tracking-wide text-muted">
+              <tr className="border-y border-border">
+                <th className="px-5 py-2 font-medium">Date</th>
+                <th className="px-3 py-2 text-right font-medium">Cash</th>
+                <th className="px-3 py-2 text-right font-medium">Santosh QR</th>
+                <th className="px-3 py-2 text-right font-medium">Praween QR</th>
+                <th className="px-3 py-2 text-right font-medium">Online</th>
+                <th className="px-3 py-2 text-right font-medium">Balance</th>
+                <th className="px-3 py-2 text-right font-medium">Food</th>
+                <th className="px-3 py-2 text-right font-medium">WS</th>
+                <th className="px-3 py-2 text-right font-medium">Expense</th>
+                <th className="px-3 py-2 text-right font-medium">Rooms</th>
+                <th className="px-3 py-2 text-right font-medium">vs ₹60k</th>
+              </tr>
+            </thead>
+            <tbody>
+              {now.rows.map((r) => (
+                <tr key={r.date} className="border-b border-border/70">
+                  <td className="px-5 py-2 font-medium">{formatDayShort(r.date)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(r.take.cash.rooms)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(r.take.santosh.rooms)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(r.take.pk.rooms)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(r.take.online.rooms)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(r.take.due.rooms)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(r.take.foodTotal)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(r.take.wsTotal)}</td>
+                  <td className="px-3 py-2 text-right tabular">{money(now.expByDay.get(r.date) ?? 0)}</td>
+                  <td className="px-3 py-2 text-right tabular font-medium">
+                    {money(r.take.roomsTotal)}
+                  </td>
+                  <td
+                    className={`px-3 py-2 text-right tabular ${r.vs >= 0 ? "text-ok" : "text-due"}`}
+                  >
+                    {r.vs >= 0 ? "+" : ""}
+                    {money(r.vs)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="border-t border-border bg-bg-warm/50 font-semibold">
+                <td className="px-5 py-2.5">{label}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.cash)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.qr)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.pk)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.online)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.due)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.food)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.ws)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.expTotal)}</td>
+                <td className="px-3 py-2.5 text-right tabular">{money(now.sales)}</td>
+                <td className="px-3 py-2.5 text-right tabular">
+                  {money(now.sales - hotel.dailyTarget * now.rows.length)}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
+        </CardContent>
+      </Card>
+
+      <Card className="print:hidden">
+        <CardHeader>
+          <CardTitle>
+            {prevLabel} vs {label}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="h-64">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={compare}>
+              <CartesianGrid stroke="#e3d7c6" vertical={false} />
+              <XAxis dataKey="name" tick={{ fill: "#3e5a4c", fontSize: 12 }} axisLine={false} tickLine={false} />
+              <YAxis
+                tickFormatter={(v) => moneyCompact(Number(v))}
+                tick={{ fill: "#3e5a4c", fontSize: 11 }}
+                axisLine={false}
+                tickLine={false}
+                width={52}
+              />
+              <Tooltip
+                formatter={(v: number) => money(v)}
+                contentStyle={{ background: "#fffdf8", border: "1px solid #e3d7c6", borderRadius: 12 }}
+              />
+              <Legend />
+              <Bar dataKey="Prev" name={prevLabel} fill="#c4b8a1" radius={[6, 6, 0, 0]} />
+              <Bar dataKey="Now" name={label} fill="#1f4a3c" radius={[6, 6, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </CardContent>
+      </Card>
+
+      <Card className="print:hidden">
+        <CardHeader>
+          <CardTitle>Daily mix · {label}</CardTitle>
+        </CardHeader>
+        <CardContent className="h-72">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={daily}>
+              <CartesianGrid stroke="#e3d7c6" vertical={false} />
+              <XAxis dataKey="date" tick={{ fill: "#3e5a4c", fontSize: 10 }} interval={2} axisLine={false} tickLine={false} />
+              <YAxis
+                tickFormatter={(v) => moneyCompact(Number(v))}
+                tick={{ fill: "#3e5a4c", fontSize: 11 }}
+                axisLine={false}
+                tickLine={false}
+                width={52}
+              />
+              <Tooltip
+                formatter={(v: number) => money(v)}
+                contentStyle={{ background: "#fffdf8", border: "1px solid #e3d7c6", borderRadius: 12 }}
+              />
+              <Legend />
+              <Bar dataKey="Cash" stackId="a" fill="#2f6b4f" />
+              <Bar dataKey="QR" stackId="a" fill="#1f4a3c" />
+              <Bar dataKey="PK" stackId="a" fill="#3d5a80" />
+              <Bar dataKey="Online" stackId="a" fill="#6f675c" />
+              <Bar dataKey="Due" stackId="a" fill="#8a5a22" />
+            </BarChart>
+          </ResponsiveContainer>
+        </CardContent>
+      </Card>
+      </>
+      )}
+    </>
+  );
+}
+
+function DetailDailyPanel() {
+  const date = useLedger((s) => s.selectedDate);
+  const hotel = useLedger((s) => s.hotel);
+  const allGuests = useLedger((s) => s.guests);
+  const guests = allGuests.filter((g) => g.date === date);
+  const food = useLedger((s) => s.food).filter((f) => f.date === date);
+  const ws = useLedger((s) => s.wholesale).filter((w) => w.date === date);
+  const expenses = useLedger((s) => s.expenses).filter((e) => e.date === date);
+  const receipts = useLedger((s) => s.balReceived).filter((r) => r.date === date);
+  const books = useDayBooks(date);
+  const lock = useMonthLock(date);
+  if (lock.closed) {
+    return <LockedOpening first={lock.first} books={lock.books} />;
+  }
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3 print:hidden">
+        <p className="text-sm text-muted">
+          {formatDay(date)} · same layout as Daily register
+        </p>
+        <Button
+          type="button"
+          onClick={() => {
+            const el = document.getElementById("day-chart");
+            if (!el) {
+              toast.error("Report is not ready");
+              return;
+            }
+            toast.message("Opening print…");
+            printHtmlDocument("Day chart", el.outerHTML);
+          }}
+        >
+          <Printer className="size-4" />
+          Print
+        </Button>
+      </div>
+      <DayChart
+        hotel={hotel.name}
+        blessing={hotel.blessing}
+        date={date}
+        guests={guests}
+        allGuests={allGuests}
+        food={food}
+        ws={ws}
+        expenses={expenses}
+        receipts={receipts}
+        books={books}
+      />
+    </div>
+  );
+}
+
+function DailyReportPanel() {
+  const date = useLedger((s) => s.selectedDate);
+  const setDate = useLedger((s) => s.setDate);
+  const days = useLedger((s) => s.days);
+  const hotel = useLedger((s) => s.hotel);
+  const allGuests = useLedger((s) => s.guests);
+  const allFood = useLedger((s) => s.food);
+  const allWs = useLedger((s) => s.wholesale);
+  const allExp = useLedger((s) => s.expenses);
+  const allRecv = useLedger((s) => s.balReceived);
+  const guests = allGuests.filter((g) => g.date === date);
+  const food = allFood.filter((f) => f.date === date);
+  const ws = allWs.filter((w) => w.date === date);
+  const expenses = allExp.filter((e) => e.date === date);
+  const receipts = allRecv.filter((r) => r.date === date);
+  const books = useDayBooks(date);
+  const lock = useMonthLock(date);
+  const take = buildDayTake(guests, food, ws);
+  const month = date.slice(0, 7);
+  const monthDays = days
+    .map((day) => day.date)
+    .filter((iso) => iso.startsWith(month))
+    .sort();
+
+  if (lock.closed) {
+    return (
+      <div className="flex flex-col gap-4">
+        <p className="text-sm text-muted">
+          {formatDay(lock.first)} · locked month · opening balance only
+        </p>
+        <LockedOpening first={lock.first} books={lock.books} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 print:hidden">
+        <p className="text-sm text-muted">
+          {formatDay(date)} · A4 daily report · reports stay open, nothing is deleted
+        </p>
+        <div className="flex flex-wrap items-center gap-4">
+          <Button
+            type="button"
+            onClick={() => {
+              const el = document.getElementById("daily-a4");
+              if (!el) {
+                window.print();
+                return;
+              }
+              toast.message("Opening print…");
+              printHtmlDocument("Daily report", el.outerHTML);
+            }}
+          >
+            <Printer className="size-4" />
+            Print
+          </Button>
+        </div>
+      </div>
+      <div className="flex gap-1.5 overflow-x-auto pb-1 print:hidden">
+        {monthDays.map((iso) => (
+          <Button
+            key={iso}
+            type="button"
+            size="sm"
+            variant={iso === date ? "default" : "outline"}
+            className="min-w-10 px-2"
+            onClick={() => setDate(iso)}
+          >
+            {Number(iso.slice(8))}
+          </Button>
+        ))}
+      </div>
+      <div className="mx-auto w-full max-w-[210mm]">
+      <DailyA4
+        hotel={hotel.name}
+        blessing={hotel.blessing}
+        date={date}
+        books={books}
+        take={take}
+        expenses={expenses}
+        receipts={receipts}
+        guests={allGuests}
+      />
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <Card className="p-4">
+      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
+      <div className="mt-1 font-display text-2xl font-semibold tabular">{value}</div>
+      {hint ? <div className="mt-1 text-xs text-muted">{hint}</div> : null}
+    </Card>
+  );
+}
+
+function Mix({ label, value, total }: { label: string; value: number; total: number }) {
+  const pct = total ? Math.round((value / total) * 100) : 0;
+  return (
+    <Card className="p-4">
+      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
+      <div className="mt-1 font-display text-xl font-semibold tabular">{money(value)}</div>
+      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-bg-warm">
+        <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+      </div>
+      <div className="mt-1 text-xs text-muted">{pct}% of room sales</div>
+    </Card>
+  );
+}

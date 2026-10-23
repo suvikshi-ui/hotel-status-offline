@@ -1,0 +1,414 @@
+import {
+  checkoutFromLastNight,
+  nightsFromDates,
+  stayBreaks,
+} from "./stay";
+import type { GuestEntry, NamedAmount, PayMode } from "./types";
+
+export interface DueLine {
+  id: string;
+  date: string;
+  name: string;
+  roomNo: string;
+  amount: number;
+  source: string | null;
+  checkIn?: string | null;
+  checkOut?: string | null;
+  inTime?: string | null;
+  outTime?: string | null;
+  stay?: "continue" | "out" | null;
+}
+
+export interface DueReceipt {
+  id: string;
+  date: string;
+  particular: string;
+  mode: PayMode;
+  amount: number;
+  payRef?: string | null;
+}
+
+export type DueStatus = "paid" | "partial" | "open";
+
+export interface DueStay {
+  id: string;
+  name: string;
+  roomNo: string;
+  checkIn: string;
+  checkOut: string | null;
+  inHouse: boolean;
+  days: number;
+  perDay: number;
+  billed: number;
+  paid: number;
+  remaining: number;
+  status: DueStatus;
+}
+
+export interface DueAccount {
+  key: string;
+  billed: number;
+  collected: number;
+  remaining: number;
+  nights: number;
+  guestCount: number;
+  firstDate: string;
+  lastDate: string;
+  guests: DueLine[];
+  stays: DueStay[];
+  receipts: DueReceipt[];
+  settled: boolean;
+  listBilled: number;
+}
+
+export function sourceKey(g: GuestEntry): string {
+  const s = (g.source ?? "").trim().toUpperCase();
+  if (s) return s;
+  return (g.name ?? "").trim().toUpperCase() || "UNKNOWN";
+}
+
+function visitKey(g: GuestEntry) {
+  return `${g.name.trim().toUpperCase()}|${g.roomNo.trim()}|${g.mode}`;
+}
+
+/** Mistaken checkout then continue stays on the original source, one name. */
+function continuedSource(g: GuestEntry, guests: GuestEntry[]): string {
+  const mine = guests
+    .filter((x) => visitKey(x) === visitKey(g))
+    .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  const chunks: GuestEntry[][] = [];
+  let cur: GuestEntry[] = [];
+  for (const n of mine) {
+    const prev = cur[cur.length - 1];
+    if (prev && stayBreaks(prev, n)) {
+      chunks.push(cur);
+      cur = [];
+    }
+    cur.push(n);
+  }
+  if (cur.length) chunks.push(cur);
+  const chunk = chunks.find((nights) => nights.some((n) => n.id === g.id)) ?? [g];
+  const named = chunk.find((n) => (n.source ?? "").trim());
+  return sourceKey(named ?? g);
+}
+
+function canonName(s: string) {
+  return s.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "");
+}
+
+export function receiptMatches(particular: string, key: string): boolean {
+  const p = particular.trim().toUpperCase();
+  const k = key.trim().toUpperCase();
+  if (!p || !k) return false;
+  if (p === k) return true;
+  const pc = canonName(p);
+  const kc = canonName(k);
+  if (pc && kc && pc === kc) return true;
+  const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^A-Z0-9])${escaped}([^A-Z0-9]|$)`).test(p);
+}
+
+function accountForReceipt(
+  particular: string,
+  map: Map<string, DueAccount>,
+  forKey?: string | null,
+): string | null {
+  const stamped = (forKey ?? "").trim().toUpperCase();
+  if (stamped && map.has(stamped)) return stamped;
+  const p = particular.trim().toUpperCase();
+  const pc = canonName(p);
+  if (!p) return null;
+  if (map.has(p)) return p;
+  if (pc) {
+    for (const key of map.keys()) {
+      if (canonName(key) === pc) return key;
+    }
+  }
+  const guestHits: string[] = [];
+  for (const [key, row] of map) {
+    const hit = row.guests.some((g) => {
+      const name = g.name.trim().toUpperCase();
+      return name === p || (pc !== "" && canonName(name) === pc);
+    });
+    if (hit) guestHits.push(key);
+  }
+  if (guestHits.length === 1) return guestHits[0] ?? null;
+  return null;
+}
+
+function personKey(g: { name: string }) {
+  return g.name.trim().toUpperCase();
+}
+
+export function splitStayNights(nights: DueLine[]): DueLine[][] {
+  const sorted = [...nights].sort(
+    (a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id),
+  );
+  const chunks: DueLine[][] = [];
+  let cur: DueLine[] = [];
+  for (const n of sorted) {
+    const prev = cur[cur.length - 1];
+    if (prev && stayBreaks(prev, n)) {
+      chunks.push(cur);
+      cur = [];
+    }
+    cur.push(n);
+  }
+  if (cur.length) chunks.push(cur);
+  return chunks;
+}
+
+export function stayFromNights(nights: DueLine[], _asOf?: string): DueStay {
+  const dates = nights.map((n) => n.date).sort();
+  const first = dates[0] ?? "";
+  const lastNight = dates[dates.length - 1] ?? first;
+  const lastRow =
+    [...nights].reverse().find((n) => n.date === lastNight) ?? nights[nights.length - 1];
+  const checkIn =
+    nights.reduce((m, n) => {
+      const v = n.checkIn || n.date;
+      return m && m < v ? m : v;
+    }, first) || first;
+  const morning = checkoutFromLastNight(lastNight);
+  const markedOut = lastRow?.stay === "out";
+  const explicitOut = markedOut ? lastRow?.checkOut || null : null;
+  const checkOut = markedOut
+    ? explicitOut && explicitOut > lastNight
+      ? explicitOut
+      : morning
+    : null;
+  const billed = nights.reduce((s, n) => s + n.amount, 0);
+  const days = nightsFromDates(checkIn, checkOut || morning) || nights.length;
+  const same = nights.length > 0 && nights.every((n) => n.amount === nights[0]!.amount);
+  const perDay = nights.length
+    ? same
+      ? nights[0]!.amount
+      : Math.round(billed / nights.length)
+    : 0;
+  return {
+    id: nights[0]?.id ?? `${checkIn}-${lastNight}`,
+    name: nights[0]?.name ?? "",
+    roomNo: nights[0]?.roomNo ?? "",
+    checkIn,
+    checkOut,
+    inHouse: !markedOut,
+    days,
+    perDay,
+    billed,
+    paid: 0,
+    remaining: billed,
+    status: billed <= 0 ? "paid" : "open",
+  };
+}
+
+export function allocateStaysFifo(stays: DueStay[], collected: number): DueStay[] {
+  const ordered = [...stays].sort(
+    (a, b) =>
+      a.checkIn.localeCompare(b.checkIn) ||
+      a.name.localeCompare(b.name) ||
+      a.roomNo.localeCompare(b.roomNo),
+  );
+  let left = Math.max(0, collected);
+  return ordered.map((stay) => {
+    const take = Math.min(stay.billed, left);
+    left -= take;
+    const remaining = Math.max(0, stay.billed - take);
+    const status: DueStatus =
+      remaining <= 0 ? "paid" : take > 0 ? "partial" : "open";
+    return { ...stay, paid: take, remaining, status };
+  });
+}
+
+function buildStays(lines: DueLine[], asOf?: string): DueStay[] {
+  const groups = new Map<string, DueLine[]>();
+  for (const g of lines) {
+    const k = personKey(g);
+    const list = groups.get(k) ?? [];
+    list.push(g);
+    groups.set(k, list);
+  }
+  const stays: DueStay[] = [];
+  for (const list of groups.values()) {
+    for (const chunk of splitStayNights(list)) {
+      stays.push(stayFromNights(chunk, asOf));
+    }
+  }
+  return stays;
+}
+
+export function buildDueAccounts(
+  guests: GuestEntry[],
+  receipts: NamedAmount[],
+): DueAccount[] {
+  const map = new Map<string, DueAccount>();
+  const asOf = guests.reduce((m, g) => (m > g.date ? m : g.date), "");
+
+  function ensure(key: string): DueAccount {
+    let row = map.get(key);
+    if (!row) {
+      row = {
+        key,
+        billed: 0,
+        collected: 0,
+        remaining: 0,
+        nights: 0,
+        guestCount: 0,
+        firstDate: "",
+        lastDate: "",
+        guests: [],
+        stays: [],
+        receipts: [],
+        settled: false,
+        listBilled: 0,
+      };
+      map.set(key, row);
+    }
+    return row;
+  }
+
+  for (const g of guests) {
+    if (g.mode !== "BALANCE") continue;
+    const key = continuedSource(g, guests);
+    const row = ensure(key);
+    row.billed += g.amount;
+    row.guests.push({
+      id: g.id,
+      date: g.date,
+      name: g.name,
+      roomNo: g.roomNo,
+      amount: g.amount,
+      source: g.source ?? null,
+      checkIn: g.checkIn ?? null,
+      checkOut: g.checkOut ?? g.coDate ?? null,
+      inTime: g.inTime ?? g.time ?? null,
+      outTime: g.outTime ?? null,
+      stay: g.stay === "out" ? "out" : "continue",
+    });
+    if (!row.firstDate || g.date < row.firstDate) row.firstDate = g.date;
+    if (!row.lastDate || g.date > row.lastDate) row.lastDate = g.date;
+  }
+
+  for (const r of receipts) {
+    if (r.kind !== "list") continue;
+    const key = (r.particular ?? "").trim().toUpperCase() || "UNKNOWN";
+    const row = ensure(key);
+    row.billed += r.amount;
+    row.listBilled += r.amount;
+    if (!row.firstDate || r.date < row.firstDate) row.firstDate = r.date;
+    if (!row.lastDate || r.date > row.lastDate) row.lastDate = r.date;
+  }
+
+  for (const r of receipts) {
+    if (r.kind === "ota" || r.kind === "other" || r.kind === "list") continue;
+    const hit = accountForReceipt(r.particular, map, r.forKey);
+    if (!hit) continue;
+    const row = map.get(hit)!;
+    row.collected += r.amount;
+    row.receipts.push({
+      id: r.id,
+      date: r.date,
+      particular: r.particular,
+      mode: r.mode,
+      amount: r.amount,
+      payRef: r.payRef ?? null,
+    });
+  }
+
+  for (const row of map.values()) {
+    row.remaining = row.billed - row.collected;
+    row.settled = row.billed > 0 && row.remaining <= 0;
+    row.guests.sort(
+      (a, b) => a.date.localeCompare(b.date) || a.name.localeCompare(b.name),
+    );
+    row.receipts.sort((a, b) => a.date.localeCompare(b.date));
+    const groups = new Map<string, DueLine[]>();
+    for (const g of row.guests) {
+      const k = personKey(g);
+      const list = groups.get(k) ?? [];
+      list.push(g);
+      groups.set(k, list);
+    }
+    for (const list of groups.values()) {
+      const inDate = list.reduce(
+        (m, g) => (m < g.date ? m : g.date),
+        list[0]!.date,
+      );
+      const chunks = splitStayNights(list);
+      for (const chunk of chunks) {
+        const chunkIn = chunk.reduce(
+          (m, g) => (m < (g.checkIn || g.date) ? m : g.checkIn || g.date),
+          chunk[0]!.date,
+        );
+        const last = [...chunk].sort((a, b) => a.date.localeCompare(b.date)).at(-1);
+        const ended = last?.stay === "out";
+        for (const g of chunk) {
+          g.checkIn = g.checkIn || chunkIn || inDate;
+          if (!ended) g.checkOut = null;
+        }
+      }
+    }
+    row.guestCount = new Set(
+      row.guests.map((g) => g.name.trim().toUpperCase()),
+    ).size;
+    row.stays = allocateStaysFifo(
+      buildStays(row.guests, asOf),
+      row.collected,
+    );
+    row.nights = row.stays.reduce((s, stay) => s + stay.days, 0);
+  }
+
+  return [...map.values()].sort((a, b) => {
+    if (a.settled !== b.settled) return a.settled ? 1 : -1;
+    if (b.remaining !== a.remaining) return b.remaining - a.remaining;
+    return a.key.localeCompare(b.key);
+  });
+}
+
+export function uniqueSources(
+  guests: GuestEntry[],
+  receipts?: NamedAmount[],
+): string[] {
+  const set = new Set<string>();
+  for (const g of guests) {
+    const s = (g.source ?? "").trim();
+    if (s) set.add(s);
+    if (g.mode === "BALANCE") {
+      const key = sourceKey(g);
+      if (key && key !== "UNKNOWN") set.add(key);
+    }
+  }
+  for (const r of receipts ?? []) {
+    if (r.kind === "ota" || r.kind === "other") continue;
+    const s = (r.particular ?? "").trim();
+    if (s) set.add(s);
+  }
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+
+export function lookupDueAccount(
+  accounts: DueAccount[],
+  name: string,
+): DueAccount | null {
+  const t = name.trim().toLowerCase();
+  if (!t) return null;
+  const exact = accounts.find((a) => a.key.toLowerCase() === t);
+  if (exact) return exact;
+  const starts = accounts.filter((a) => a.key.toLowerCase().startsWith(t));
+  if (starts.length === 1) return starts[0] ?? null;
+  const includes = accounts.filter((a) => a.key.toLowerCase().includes(t));
+  if (includes.length === 1) return includes[0] ?? null;
+  const guestHits = accounts.filter((a) =>
+    a.guests.some(
+      (g) =>
+        g.name.toLowerCase().includes(t) || g.roomNo.toLowerCase() === t,
+    ),
+  );
+  if (guestHits.length === 1) return guestHits[0] ?? null;
+  return null;
+}
+
+export function dueStatusLabel(status: DueStatus) {
+  if (status === "paid") return "Paid";
+  if (status === "partial") return "Partial";
+  return "Open";
+}
